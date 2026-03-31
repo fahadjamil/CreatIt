@@ -54,31 +54,40 @@
         </p>
 
         <label class="auth-field">
-          <div class="auth-phone">
+          <div class="auth-phone" :class="{ 'auth-phone--error': phoneError }">
             <select
-              v-model="countryCode"
+              v-model="selectedCountryIso"
               class="auth-input auth-phone-code"
-              aria-label="Country code"
+              aria-label="Country"
             >
               <option
                 v-for="country in countryCodes"
                 :key="country.code"
-                :value="country.dial_code"
+                :value="country.code"
               >
-                {{ country.dial_code }}
+                {{ country.name }} ({{ country.dial_code }})
               </option>
             </select>
             <input
               v-model="phoneNumber"
               class="auth-input"
+              :class="{ 'auth-input--error': phoneError }"
               type="tel"
               placeholder="XXX-XXXXXX"
+              @input="phoneError = ''"
             />
           </div>
+          <p v-if="phoneError" class="auth-field-error">{{ phoneError }}</p>
         </label>
 
-        <button class="auth-button" type="button" @click="sendPhoneVerificationCode">
-          Continue
+        <button
+          class="auth-button"
+          type="button"
+          :disabled="isSendingCode"
+          @click="sendPhoneVerificationCode"
+        >
+          <span v-if="isSendingCode" class="auth-button-loader" aria-hidden="true"></span>
+          {{ isSendingCode ? "Sending..." : "Continue" }}
         </button>
         <p class="auth-consent">
           By proceeding, you agree to our<br />
@@ -110,6 +119,10 @@
             inputmode="numeric"
             maxlength="1"
             v-model="verificationDigits[0]"
+            :ref="(el) => setOtpInputRef(el, 0)"
+            @input="onOtpInput(0, $event)"
+            @keydown="onOtpKeydown(0, $event)"
+            @paste="onOtpPaste(0, $event)"
           />
           <input
             class="auth-otp-input"
@@ -117,6 +130,10 @@
             inputmode="numeric"
             maxlength="1"
             v-model="verificationDigits[1]"
+            :ref="(el) => setOtpInputRef(el, 1)"
+            @input="onOtpInput(1, $event)"
+            @keydown="onOtpKeydown(1, $event)"
+            @paste="onOtpPaste(1, $event)"
           />
           <input
             class="auth-otp-input"
@@ -124,6 +141,10 @@
             inputmode="numeric"
             maxlength="1"
             v-model="verificationDigits[2]"
+            :ref="(el) => setOtpInputRef(el, 2)"
+            @input="onOtpInput(2, $event)"
+            @keydown="onOtpKeydown(2, $event)"
+            @paste="onOtpPaste(2, $event)"
           />
           <input
             class="auth-otp-input"
@@ -131,10 +152,20 @@
             inputmode="numeric"
             maxlength="1"
             v-model="verificationDigits[3]"
+            :ref="(el) => setOtpInputRef(el, 3)"
+            @input="onOtpInput(3, $event)"
+            @keydown="onOtpKeydown(3, $event)"
+            @paste="onOtpPaste(3, $event)"
           />
         </div>
-        <button class="auth-otp-resend" type="button" @click="sendPhoneVerificationCode">
-          Resend code
+        <button
+          class="auth-otp-resend"
+          type="button"
+          :disabled="isSendingCode"
+          @click="sendPhoneVerificationCode"
+        >
+          <span v-if="isSendingCode" class="auth-button-loader auth-button-loader--small" aria-hidden="true"></span>
+          {{ isSendingCode ? "Resending..." : "Resend code" }}
         </button>
         <button class="auth-button" type="button" @click="goToStep(3)">
           Submit Code
@@ -192,12 +223,15 @@
           <input
             v-model="email"
             class="auth-input"
+            :class="{ 'auth-input--error': emailError }"
             type="email"
             placeholder="email@email.com"
+            @input="emailError = ''"
           />
+          <p v-if="emailError" class="auth-field-error">{{ emailError }}</p>
         </label>
 
-        <button class="auth-button" type="button" @click="goToStep(5)">
+        <button class="auth-button" type="button" @click="goToReachYouNext">
           Next
         </button>
       </div>
@@ -240,8 +274,10 @@
           <input
             v-model="passwordConfirmation"
             class="auth-input"
+            :class="{ 'auth-input--error': passwordError }"
             type="password"
             placeholder="Re-enter your password"
+            @input="passwordError = ''"
           />
           <button
             class="auth-input-icon"
@@ -260,6 +296,7 @@
               />
             </svg>
           </button>
+          <p v-if="passwordError" class="auth-field-error">{{ passwordError }}</p>
         </label>
 
         <div class="auth-security">
@@ -273,7 +310,7 @@
           </ul>
         </div>
 
-        <button class="auth-button" type="button" @click="goToStep(6)">
+        <button class="auth-button" type="button" @click="goToSecureAccountNext">
           Next
         </button>
       </div>
@@ -386,13 +423,8 @@
           </div>
         </div>
 
-        <button
-          class="auth-button"
-          type="button"
-          :disabled="isSubmitting"
-       
-        >
-          {{ isSubmitting ? "Submitting..." : "Next" }}
+        <button class="auth-button" type="button" @click="goToStep(8)">
+          Next
         </button>
       </div>
       <div v-else class="auth-card auth-card--compact auth-card--left">
@@ -430,10 +462,16 @@
           </div>
         </div>
 
-        <button class="auth-button auth-button--outline"    @click="submitRegistration" type="button">
-          Go To Dashboard
+        <button
+          class="auth-button auth-button--outline"
+          type="button"
+          :disabled="isSubmitting"
+          @click="submitRegistration"
+        >
+          <span v-if="isSubmitting" class="auth-button-loader" aria-hidden="true"></span>
+          {{ isSubmitting ? "Submitting..." : "Go To Dashboard" }}
         </button>
-        <button class="auth-button" type="button">Create My Wallet</button>
+        <button class="auth-button" type="button" @click="goToWalletSetup">Create My Wallet</button>
       </div>
     </div>
 
@@ -441,18 +479,47 @@
       Having trouble accessing your account?
       <button class="auth-link-support" type="button">Contact Support</button>
     </footer>
+
+    <Teleport to="body">
+      <Transition name="auth-otp-toast-fade">
+        <div
+          v-if="otpToastVisible"
+          class="auth-otp-toast"
+          role="status"
+          aria-live="polite"
+        >
+          <div class="auth-otp-toast-inner">
+            <span class="auth-otp-toast-label">Verification code</span>
+            <span class="auth-otp-toast-value">{{ otpToastText }}</span>
+          </div>
+          <button
+            type="button"
+            class="auth-otp-toast-close"
+            aria-label="Dismiss"
+            @click="dismissOtpToast"
+          >
+            ×
+          </button>
+        </div>
+      </Transition>
+    </Teleport>
   </section>
 </template>
 
 <script setup>
-import { computed, ref } from "vue";
+import { computed, onUnmounted, ref } from "vue";
+import { useRouter } from "vue-router";
 import { registerUser, requestPhoneVerificationCode } from "@/lib/api";
+import { getRegisterDevicePayload } from "@/lib/device";
+
+const router = useRouter();
 
 const step = ref(1);
 const skillQuery = ref("");
 const selectedSkills = ref(new Set());
 const maxSkills = 5;
-const countryCode = ref("+61");
+/** ISO 3166-1 alpha-2 (or project-specific unique id); matches `countryCodes[].code` */
+const selectedCountryIso = ref("AU");
 const phoneNumber = ref("");
 const isSendingCode = ref(false);
 const verificationDigits = ref(["", "", "", ""]);
@@ -463,11 +530,28 @@ const password = ref("");
 const passwordConfirmation = ref("");
 const accountType = ref("creator");
 const isSubmitting = ref(false);
+const emailError = ref("");
+const phoneError = ref("");
+const otpToastVisible = ref(false);
+const otpToastText = ref("");
+let otpToastHideTimer = null;
+
+const isValidPhoneNumber = (value) => {
+  const digitsOnly = (value || "").replace(/\D/g, "");
+  return digitsOnly.length >= 7 && digitsOnly.length <= 15;
+};
+
+const isValidEmail = (value) => {
+  const trimmed = (value || "").trim();
+  if (!trimmed) return false;
+  const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+  return emailRegex.test(trimmed);
+};
 
 const skills = [
   "Video Production",
   "Photo Editing",
-  "Tiktok Creation",
+  "TikTok Creation",
   "Script writing",
   "Animation skills",
   "Voice Acting",
@@ -732,7 +816,7 @@ const contentCreationSkillSet = new Set([
   "Live streaming",
 ]);
 
-const socialMediaSkillSet = new Set(["Instagram Marketing", "Tiktok Creation"]);
+const socialMediaSkillSet = new Set(["Instagram Marketing", "TikTok Creation"]);
 
 const fullName = computed(() =>
   [firstName.value.trim(), lastName.value.trim()].filter(Boolean).join(" ")
@@ -742,17 +826,26 @@ const phoneVerificationCode = computed(() =>
   verificationDigits.value.map((digit) => digit.trim()).join("")
 );
 
+const selectedCountry = computed(() => {
+  const found = countryCodes.find((c) => c.code === selectedCountryIso.value);
+  return found ?? countryCodes.find((c) => c.code === "AU");
+});
+
+const countryDialCode = computed(
+  () => selectedCountry.value?.dial_code ?? "+61"
+);
+
 const fullPhoneNumber = computed(() => {
   const digits = phoneNumber.value.trim();
   if (!digits) {
     return "";
   }
-  return `${countryCode.value}${digits}`;
+  return `${countryDialCode.value}${digits}`;
 });
 
 const phoneDisplay = computed(() => {
   const combined = fullPhoneNumber.value;
-  return combined || `${countryCode.value} 3XX-XXXXXX`;
+  return combined || `${countryDialCode.value} 3XX-XXXXXX`;
 });
 
 const filteredSkills = computed(() => {
@@ -763,17 +856,180 @@ const filteredSkills = computed(() => {
   return skills.filter((skill) => skill.toLowerCase().includes(query));
 });
 
+/**
+ * Reads OTP from common API response shapes (dev/staging often return the code in JSON).
+ */
+const extractOtpFromApiResponse = (payload) => {
+  const keyCandidates = [
+    "otp",
+    "verification_code",
+    "phone_verification_code",
+    "sms_code",
+    "code",
+  ];
+  const looksLikeOtpString = (t) => {
+    if (!/^[\dA-Za-z]{4,12}$/.test(t)) return false;
+    return /\d/.test(t);
+  };
+  const tryObject = (obj) => {
+    if (!obj || typeof obj !== "object") return null;
+    for (const key of keyCandidates) {
+      const v = obj[key];
+      if (typeof v === "string" && v.trim()) {
+        const t = v.trim();
+        if (looksLikeOtpString(t)) return t;
+      }
+      if (typeof v === "number" && Number.isFinite(v)) {
+        const s = String(v);
+        if (s.length >= 4 && s.length <= 12 && /^\d+$/.test(s)) return s;
+      }
+    }
+    return null;
+  };
+  let found = tryObject(payload);
+  if (found) return found;
+  if (payload && typeof payload === "object" && payload.data != null) {
+    found = tryObject(payload.data);
+    if (found) return found;
+  }
+  return null;
+};
+
+const dismissOtpToast = () => {
+  otpToastVisible.value = false;
+  otpToastText.value = "";
+  if (otpToastHideTimer != null) {
+    clearTimeout(otpToastHideTimer);
+    otpToastHideTimer = null;
+  }
+};
+
+const showOtpFromApi = (otp) => {
+  if (!otp) return;
+  otpToastText.value = otp;
+  otpToastVisible.value = true;
+  if (otpToastHideTimer != null) clearTimeout(otpToastHideTimer);
+  otpToastHideTimer = setTimeout(() => {
+    dismissOtpToast();
+  }, 12000);
+
+  try {
+    if (typeof Notification === "undefined") return;
+    if (Notification.permission !== "granted") return;
+    new Notification("Verification code", {
+      body: `Your code is ${otp}`,
+      tag: "createit-phone-otp",
+    });
+  } catch {
+    /* ignore Notification errors */
+  }
+};
+
+onUnmounted(() => {
+  if (otpToastHideTimer != null) clearTimeout(otpToastHideTimer);
+});
+
 const goToStep = (nextStep) => {
   step.value = nextStep;
 };
 
+const otpInputRefs = [];
+
+const setOtpInputRef = (el, index) => {
+  otpInputRefs[index] = el ?? null;
+};
+
+const focusOtpInput = (index) => {
+  const target = otpInputRefs[index];
+  if (!target) return;
+  target.focus();
+  target.select();
+};
+
+const onOtpInput = (index, event) => {
+  const input = event?.target;
+  if (!input) return;
+  const digits = String(input.value ?? "").replace(/\D/g, "");
+  const char = digits.slice(-1);
+  verificationDigits.value[index] = char;
+  input.value = char;
+  if (char && index < verificationDigits.value.length - 1) {
+    focusOtpInput(index + 1);
+  }
+};
+
+const onOtpKeydown = (index, event) => {
+  const key = event?.key;
+  if (key === "Backspace" && !verificationDigits.value[index] && index > 0) {
+    focusOtpInput(index - 1);
+  }
+};
+
+const onOtpPaste = (index, event) => {
+  const text = event?.clipboardData?.getData("text") ?? "";
+  const digits = text.replace(/\D/g, "");
+  if (!digits) return;
+  event.preventDefault();
+  let cursor = index;
+  for (const digit of digits) {
+    if (cursor >= verificationDigits.value.length) break;
+    verificationDigits.value[cursor] = digit;
+    cursor += 1;
+  }
+  const nextIndex = Math.min(cursor, verificationDigits.value.length - 1);
+  focusOtpInput(nextIndex);
+};
+
+const goToReachYouNext = () => {
+  emailError.value = "";
+  const trimmed = (email.value || "").trim();
+  if (!trimmed) {
+    emailError.value = "Please enter your email address.";
+    return;
+  }
+  if (!isValidEmail(trimmed)) {
+    emailError.value = "Please enter a valid email address.";
+    return;
+  }
+  goToStep(5);
+};
+
+const passwordError = ref("");
+
+const goToSecureAccountNext = () => {
+  passwordError.value = "";
+  if (password.value !== passwordConfirmation.value) {
+    passwordError.value = "Password and confirm password must be the same.";
+    return;
+  }
+  goToStep(6);
+};
+
 const sendPhoneVerificationCode = async () => {
+  phoneError.value = "";
+  const trimmed = (phoneNumber.value || "").trim();
+  if (!trimmed) {
+    phoneError.value = "Please enter your phone number.";
+    return;
+  }
+  if (!isValidPhoneNumber(trimmed)) {
+    phoneError.value = "Please enter a valid phone number (7–15 digits).";
+    return;
+  }
   if (isSendingCode.value) {
     return;
   }
   isSendingCode.value = true;
   try {
-    await requestPhoneVerificationCode({ phone_number: fullPhoneNumber.value });
+    const res = await requestPhoneVerificationCode({
+      phone_number: fullPhoneNumber.value,
+      country_name: selectedCountry.value?.name,
+      country_iso_code: selectedCountry.value?.code,
+    });
+    const otp = extractOtpFromApiResponse(res?.data);
+    if (otp) {
+      showOtpFromApi(otp);
+    }
     goToStep(2);
   } catch (error) {
     console.error("Phone verification code request failed", error);
@@ -781,34 +1037,6 @@ const sendPhoneVerificationCode = async () => {
     isSendingCode.value = false;
   }
 };
-
-const getDeviceId = () => {
-  try {
-    const storageKey = "createit_device_id";
-    const existing = localStorage.getItem(storageKey);
-    if (existing) {
-      return existing;
-    }
-    const nextId =
-      typeof crypto !== "undefined" && "randomUUID" in crypto
-        ? crypto.randomUUID()
-        : `device-${Date.now()}`;
-    localStorage.setItem(storageKey, nextId);
-    return nextId;
-  } catch (error) {
-    return "device-unknown";
-  }
-};
-
-const getDevicePayload = () => ({
-  platform: "web",
-  device_id: getDeviceId(),
-  device_name: "Web Browser",
-  device_model: navigator.userAgent,
-  os_version: navigator.platform ?? "web",
-  app_version: "1.0.0",
-  push_token: "",
-});
 
 const submitRegistration = async () => {
   if (isSubmitting.value) {
@@ -824,7 +1052,7 @@ const submitRegistration = async () => {
       email: email.value,
       password: password.value,
       password_confirmation: passwordConfirmation.value,
-      device: getDevicePayload(),
+      device: getRegisterDevicePayload(),
       kyc: {
         account_type: accountType.value,
         skills: {
@@ -838,13 +1066,45 @@ const submitRegistration = async () => {
       },
     };
 
-    await registerUser(payload);
-    goToStep(8);
+    console.log("Registration payload:", payload);
+    const registerResponse = await registerUser(payload);
+    console.log("Registration response:", registerResponse?.data);
+    const customerData = {
+      phone_number: fullPhoneNumber.value,
+      country_name: selectedCountry.value?.name ?? "",
+      country_iso_code: selectedCountry.value?.code ?? "",
+      first_name: firstName.value,
+      last_name: lastName.value,
+      name: fullName.value,
+      email: email.value,
+      account_type: accountType.value,
+      skills: {
+        content_creation: selected.filter((skill) =>
+          contentCreationSkillSet.has(skill)
+        ),
+        social_media: selected.filter((skill) =>
+          socialMediaSkillSet.has(skill)
+        ),
+      },
+    };
+    try {
+      sessionStorage.setItem(
+        "createit_signup_customer_data",
+        JSON.stringify(customerData, null, 2)
+      );
+    } catch (e) {
+      /* ignore storage errors */
+    }
+    router.push("/auth/login");
   } catch (error) {
     console.error("Registration failed", error);
   } finally {
     isSubmitting.value = false;
   }
+};
+
+const goToWalletSetup = () => {
+  router.push({ path: "/wallet/setup", query: { from: "signup" } });
 };
 
 const toggleSkill = (skill) => {

@@ -17,12 +17,22 @@
 
       <label class="auth-field">
         <span>Email</span>
-        <input class="auth-input" type="email" placeholder="you@example.com" />
+        <input
+          v-model="email"
+          class="auth-input"
+          type="email"
+          placeholder="you@example.com"
+        />
       </label>
 
       <label class="auth-field">
         <span>Password</span>
-        <input class="auth-input" type="password" placeholder="••••••••" />
+        <input
+          v-model="password"
+          class="auth-input"
+          type="password"
+          placeholder="••••••••"
+        />
       </label>
 
       <div class="auth-row">
@@ -35,8 +45,14 @@
         </RouterLink>
       </div>
 
-      <button class="auth-button" type="button" @click="handleSignIn">
-        Sign In
+      <button
+        class="auth-button"
+        type="button"
+        :disabled="isSigningIn"
+        @click="handleSignIn"
+      >
+        <span v-if="isSigningIn" class="auth-button-loader" aria-hidden="true"></span>
+        {{ isSigningIn ? "Signing in..." : "Sign In" }}
       </button>
     </div>
 
@@ -47,12 +63,45 @@
   </section>
 </template>
 
-<script setup>
+<script setup lang="ts">
+import { ref } from "vue";
 import { useRouter } from "vue-router";
+import { loginUser } from "@/lib/api";
+import { extractAuthTokens, setAuthSession } from "@/lib/auth";
+import { getLoginDevicePayload } from "@/lib/device";
 
 const router = useRouter();
+const email = ref("");
+const password = ref("");
+const isSigningIn = ref(false);
 
-const handleSignIn = () => {
-  router.push("/dashboard");
+const handleSignIn = async () => {
+  if (isSigningIn.value) return;
+
+  const payload = {
+    email: email.value.trim(),
+    password: password.value,
+    device: getLoginDevicePayload(),
+  };
+
+  isSigningIn.value = true;
+  try {
+    const response = await loginUser(payload);
+    const tokens = extractAuthTokens(response?.data);
+    const authSession = {
+      token: tokens.token,
+      accessToken: tokens.accessToken,
+      refreshToken: tokens.refreshToken,
+      // Keep cookie payload tiny to avoid truncation.
+      user: null,
+      loggedInAt: new Date().toISOString(),
+    };
+    setAuthSession(authSession);
+    router.push("/dashboard");
+  } catch (error) {
+    // Alerts are handled globally in the API client.
+  } finally {
+    isSigningIn.value = false;
+  }
 };
 </script>
