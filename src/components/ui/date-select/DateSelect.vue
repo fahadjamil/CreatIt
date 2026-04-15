@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue";
 
 type Mode = "week" | "month" | "year";
 
@@ -10,12 +10,18 @@ const props = withDefaults(
     disabled?: boolean;
     /** Display format only (stored value remains ISO `YYYY-MM-DD`). */
     displayFormat?: "dd/mm/yyyy" | "d mon, yyyy" | "mon d, yyyy";
+    /**
+     * Picking a day updates the model and closes immediately (no Apply).
+     * Use inside modal dialogs so users are not confused by the two-step flow.
+     */
+    commitOnSelect?: boolean;
   }>(),
   {
     modelValue: "",
     placeholder: "DD/MM/YYYY",
     disabled: false,
     displayFormat: "dd/mm/yyyy",
+    commitOnSelect: false,
   },
 );
 
@@ -27,8 +33,36 @@ const emit = defineEmits<{
 
 const open = ref(false);
 const mode = ref<Mode>("week");
+const anchorRef = ref<HTMLElement | null>(null);
+/** Popover is portaled to `body` so it is not clipped by `overflow: auto` on dialogs and stacks above modal surfaces. */
+const popoverPos = ref({ top: 0, left: 0, width: 320 });
 
 const draftIso = ref<string>("");
+
+const popoverFixedStyle = computed(() => ({
+  top: `${popoverPos.value.top}px`,
+  left: `${popoverPos.value.left}px`,
+  width: `${popoverPos.value.width}px`,
+}));
+
+function updatePopoverPosition() {
+  const wrap = anchorRef.value;
+  if (!wrap) return;
+  const r = wrap.getBoundingClientRect();
+  const vw = window.innerWidth;
+  const vh = window.innerHeight;
+  const width = Math.min(320, vw - 24);
+  let left = r.left;
+  let top = r.bottom + 6;
+  if (left + width > vw - 12) left = Math.max(12, vw - width - 12);
+  const estPopoverH = 400;
+  if (top + estPopoverH > vh - 12) top = Math.max(12, r.top - estPopoverH - 6);
+  popoverPos.value = { top, left, width };
+}
+
+function onViewportChange() {
+  if (open.value) updatePopoverPosition();
+}
 
 function pad2(n: number) {
   return String(n).padStart(2, "0");
@@ -83,7 +117,7 @@ watch(
   { immediate: true },
 );
 
-watch(open, (isOpen) => {
+watch(open, async (isOpen) => {
   if (isOpen) {
     draftIso.value = String(props.modelValue || "");
     const d = parseIso(draftIso.value);
@@ -91,6 +125,8 @@ watch(open, (isOpen) => {
       viewMonth.value = d.getMonth();
       viewYear.value = d.getFullYear();
     }
+    await nextTick();
+    updatePopoverPosition();
   }
 });
 
@@ -151,6 +187,11 @@ function nextMonth() {
 
 function selectIso(iso: string) {
   draftIso.value = iso;
+  if (props.commitOnSelect) {
+    emit("update:modelValue", iso);
+    emit("apply", iso);
+    open.value = false;
+  }
 }
 
 function onReset() {
@@ -175,12 +216,20 @@ function onKeydown(e: KeyboardEvent) {
   if (e.key === "Escape") open.value = false;
 }
 
-onMounted(() => window.addEventListener("keydown", onKeydown));
-onBeforeUnmount(() => window.removeEventListener("keydown", onKeydown));
+onMounted(() => {
+  window.addEventListener("keydown", onKeydown);
+  window.addEventListener("resize", onViewportChange);
+  window.addEventListener("scroll", onViewportChange, true);
+});
+onBeforeUnmount(() => {
+  window.removeEventListener("keydown", onKeydown);
+  window.removeEventListener("resize", onViewportChange);
+  window.removeEventListener("scroll", onViewportChange, true);
+});
 </script>
 
 <template>
-  <div class="ds-wrap">
+  <div ref="anchorRef" class="ds-wrap">
     <button
       type="button"
       class="ds-input"
@@ -206,52 +255,58 @@ onBeforeUnmount(() => window.removeEventListener("keydown", onKeydown));
       <Transition name="ds-fade">
         <div v-if="open" class="ds-backdrop" aria-hidden="true" @click="onBackdrop" />
       </Transition>
+      <Transition name="ds-pop">
+        <div
+          v-if="open"
+          class="ds-popover ds-popover--fixed"
+          role="dialog"
+          aria-label="Choose date"
+          :style="popoverFixedStyle"
+          @pointerdown.stop
+        >
+          <div class="ds-mode">
+            <button type="button" class="ds-mode-btn" :class="{ 'ds-mode-btn--active': mode === 'week' }" @click="mode = 'week'">
+              Week
+            </button>
+            <button type="button" class="ds-mode-btn" :class="{ 'ds-mode-btn--active': mode === 'month' }" @click="mode = 'month'">
+              Month
+            </button>
+            <button type="button" class="ds-mode-btn" :class="{ 'ds-mode-btn--active': mode === 'year' }" @click="mode = 'year'">
+              Year
+            </button>
+          </div>
+
+          <div class="ds-head">
+            <button type="button" class="ds-nav" aria-label="Previous month" @click="prevMonth">‹</button>
+            <div class="ds-month">{{ monthLabel }}</div>
+            <button type="button" class="ds-nav" aria-label="Next month" @click="nextMonth">›</button>
+          </div>
+
+          <div class="ds-grid">
+            <div v-for="w in weekdays" :key="w" class="ds-weekday">{{ w }}</div>
+
+            <button
+              v-for="cell in calendarCells"
+              :key="cell.iso"
+              type="button"
+              class="ds-day"
+              :class="{
+                'ds-day--muted': !cell.inMonth,
+                'ds-day--selected': cell.iso === draftIso,
+              }"
+              @click="selectIso(cell.iso)"
+            >
+              {{ cell.day }}
+            </button>
+          </div>
+
+          <div class="ds-actions">
+            <button type="button" class="ds-action ds-action--ghost" @click="onReset">Reset</button>
+            <button type="button" class="ds-action ds-action--primary" @click="onApply">Apply</button>
+          </div>
+        </div>
+      </Transition>
     </Teleport>
-
-    <Transition name="ds-pop">
-      <div v-if="open" class="ds-popover" role="dialog" aria-label="Choose date" @pointerdown.stop>
-        <div class="ds-mode">
-          <button type="button" class="ds-mode-btn" :class="{ 'ds-mode-btn--active': mode === 'week' }" @click="mode = 'week'">
-            Week
-          </button>
-          <button type="button" class="ds-mode-btn" :class="{ 'ds-mode-btn--active': mode === 'month' }" @click="mode = 'month'">
-            Month
-          </button>
-          <button type="button" class="ds-mode-btn" :class="{ 'ds-mode-btn--active': mode === 'year' }" @click="mode = 'year'">
-            Year
-          </button>
-        </div>
-
-        <div class="ds-head">
-          <button type="button" class="ds-nav" aria-label="Previous month" @click="prevMonth">‹</button>
-          <div class="ds-month">{{ monthLabel }}</div>
-          <button type="button" class="ds-nav" aria-label="Next month" @click="nextMonth">›</button>
-        </div>
-
-        <div class="ds-grid">
-          <div v-for="w in weekdays" :key="w" class="ds-weekday">{{ w }}</div>
-
-          <button
-            v-for="cell in calendarCells"
-            :key="cell.iso"
-            type="button"
-            class="ds-day"
-            :class="{
-              'ds-day--muted': !cell.inMonth,
-              'ds-day--selected': cell.iso === draftIso,
-            }"
-            @click="selectIso(cell.iso)"
-          >
-            {{ cell.day }}
-          </button>
-        </div>
-
-        <div class="ds-actions">
-          <button type="button" class="ds-action ds-action--ghost" @click="onReset">Reset</button>
-          <button type="button" class="ds-action ds-action--primary" @click="onApply">Apply</button>
-        </div>
-      </div>
-    </Transition>
   </div>
 </template>
 
@@ -289,7 +344,7 @@ onBeforeUnmount(() => window.removeEventListener("keydown", onKeydown));
 .ds-input:focus {
   outline: none;
   border-color: #0f172a;
-  box-shadow: 0 0 0 2px rgba(15, 23, 42, 0.1);
+  box-shadow: none;
 }
 
 .ds-input-text {
@@ -308,22 +363,29 @@ onBeforeUnmount(() => window.removeEventListener("keydown", onKeydown));
 .ds-backdrop {
   position: fixed;
   inset: 0;
-  z-index: 9998;
+  /* Above app dialogs (z ~480), below app toasts (z 10000) */
+  z-index: 9500;
   background: transparent;
+  /* Modal dialogs set body pointer-events: none; keep picker interactive. */
+  pointer-events: auto;
 }
 
 .ds-popover {
-  position: absolute;
-  top: calc(100% + 6px);
-  left: 0;
-  z-index: 9999;
-  width: 320px;
-  max-width: calc(100vw - 24px);
   padding: 12px;
   border-radius: 12px;
   background: #ffffff;
   border: 1px solid #e2e8f0;
-  box-shadow: 0 10px 40px rgba(15, 23, 42, 0.12);
+  box-shadow:
+    0 10px 40px rgba(15, 23, 42, 0.14),
+    0 0 0 1px rgba(15, 23, 42, 0.04);
+  max-width: calc(100vw - 24px);
+  box-sizing: border-box;
+}
+
+.ds-popover--fixed {
+  position: fixed;
+  z-index: 9510;
+  pointer-events: auto;
 }
 
 .ds-mode {

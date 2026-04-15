@@ -2,14 +2,29 @@
 import { computed, onMounted, reactive, ref, watch } from "vue";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
-import { createClient as createClientApi, getClients, getProjects } from "@/lib/api";
+import {
+  createClient as createClientApi,
+  extractMessage,
+  getClientById,
+  getClients,
+  getProjects,
+  updateClient as updateClientApi,
+} from "@/lib/api";
 import { useAlerts } from "@/composables/useAlerts";
+import {
+  projectStatusLabel,
+  projectStatusVariant,
+} from "@/lib/projectStatus";
+
+const { pushAlert } = useAlerts();
 
 type BaseClientRow = {
   id: string;
   type: "brand" | "individual";
   clientName: string;
   brandName?: string;
+  /** Point-of-contact name (from API `poc_name`). */
+  pocName?: string;
   email?: string;
   mobileNumber?: string;
   status: "active" | "inactive";
@@ -25,7 +40,7 @@ type ClientRow = BaseClientRow & {
 };
 
 const emit = defineEmits<{
-  (e: "open-new-project"): void;
+  (e: "open-new-project", projectId?: string): void;
   (e: "open-project-details", projectId: string): void;
   (e: "request-tab", tab: "projects" | "clients" | "draft"): void;
 }>();
@@ -39,8 +54,6 @@ const props = withDefaults(
     lockTab: undefined,
   }
 );
-
-const { pushAlert } = useAlerts();
 
 const activeTab = ref<"projects" | "clients" | "draft">(props.initialTab);
 const searchQuery = ref("");
@@ -71,6 +84,7 @@ watch(
 type ProjectRow = {
   id: string;
   title: string;
+  scopeLabel: string;
   clientName: string;
   amountLabel: string;
   /** Numeric amount formatted for display (e.g. "250,000") */
@@ -80,21 +94,20 @@ type ProjectRow = {
   status: string;
 };
 
-type ProjectStatus =
-  | "signed"
-  | "completed"
-  | "in-dispute"
-  | "in-progress"
-  | "draft"
-  | "delayed"
-  | "payment-due";
-
 const isLoadingProjects = ref(false);
 const projects = ref<ProjectRow[]>([]);
 const clients = ref<ClientRow[]>([]);
-const drafts = ref([]);
+const draftProjects = computed(() =>
+  projects.value.filter((p) => projectStatusVariant(p.status) === "draft"),
+);
+const activeProjects = computed(() =>
+  projects.value.filter((p) => projectStatusVariant(p.status) !== "draft"),
+);
 
 const isAddClientOpen = ref(false);
+const editingClientId = ref<string | null>(null);
+const isClientSaving = ref(false);
+const isClientLoading = ref(false);
 const addClientForm = reactive({
   type: "brand" as "brand" | "individual",
   clientName: "",
@@ -106,15 +119,28 @@ const addClientForm = reactive({
 });
 
 const showEmptyState = computed(() => {
-  if (activeTab.value === "projects") return projects.value.length === 0;
+  if (activeTab.value === "projects") return activeProjects.value.length === 0;
   if (activeTab.value === "clients") return clients.value.length === 0;
-  return drafts.value.length === 0;
+  return draftProjects.value.length === 0;
 });
-const canCreateClient = computed(() => addClientForm.clientName.trim().length > 0);
+const canCreateClient = computed(() => {
+  const name = addClientForm.clientName.trim();
+  const brand = addClientForm.brandName.trim();
+  if (addClientForm.type === "brand") return name.length > 0 || brand.length > 0;
+  return name.length > 0;
+});
 const filteredProjects = computed(() => {
   const q = searchQuery.value.trim().toLowerCase();
-  if (!q) return projects.value;
-  return projects.value.filter((p) =>
+  if (!q) return activeProjects.value;
+  return activeProjects.value.filter((p) =>
+    [p.title, p.clientName, p.status, p.paymentType].join(" ").toLowerCase().includes(q),
+  );
+});
+
+const filteredDrafts = computed(() => {
+  const q = searchQuery.value.trim().toLowerCase();
+  if (!q) return draftProjects.value;
+  return draftProjects.value.filter((p) =>
     [p.title, p.clientName, p.status, p.paymentType].join(" ").toLowerCase().includes(q),
   );
 });
@@ -123,7 +149,7 @@ const filteredClients = computed(() => {
   const q = searchQuery.value.trim().toLowerCase();
   if (!q) return clients.value;
   return clients.value.filter((c) => {
-    const hay = [c.clientName, c.companyLine, c.brandName, c.email, c.mobileNumber]
+    const hay = [c.clientName, c.companyLine, c.brandName, c.pocName, c.email, c.mobileNumber]
       .filter(Boolean)
       .join(" ")
       .toLowerCase();
@@ -132,9 +158,9 @@ const filteredClients = computed(() => {
 });
 
 const tabCounts = computed(() => ({
-  projects: projects.value.length,
+  projects: activeProjects.value.length,
   clients: clients.value.length,
-  draft: drafts.value.length,
+  draft: draftProjects.value.length,
 }));
 
 const projectsTotalPages = computed(() =>
@@ -175,18 +201,6 @@ function normalizePaymentType(paymentType: string): string {
   return paymentType;
 }
 
-function normalizeStatus(status: string): ProjectStatus {
-  const value = status.trim().toLowerCase();
-  if (value.includes("payment") && (value.includes("due") || value.includes("overdue")))
-    return "payment-due";
-  if (value.includes("delay")) return "delayed";
-  if (value.includes("in_progress") || value.includes("in-progress")) return "in-progress";
-  if (value.includes("draft")) return "draft";
-  if (value.includes("complete")) return "completed";
-  if (value.includes("dispute")) return "in-dispute";
-  return "signed";
-}
-
 function normalizeClientStatus(status: unknown): "active" | "inactive" {
   const value = String(status ?? "")
     .trim()
@@ -195,18 +209,11 @@ function normalizeClientStatus(status: unknown): "active" | "inactive" {
 }
 
 function statusLabel(status: string): string {
-  const normalized = normalizeStatus(status);
-  if (normalized === "in-progress") return "In Progress";
-  if (normalized === "draft") return "Draft";
-  if (normalized === "completed") return "Completed";
-  if (normalized === "in-dispute") return "In Dispute";
-  if (normalized === "delayed") return "Delayed";
-  if (normalized === "payment-due") return "Payment Due";
-  return "Signed";
+  return projectStatusLabel(status);
 }
 
 function statusClass(status: string): string {
-  return `dashboard-status-pill--${normalizeStatus(status)}`;
+  return `dashboard-status-pill--${projectStatusVariant(status)}`;
 }
 
 /** Display due date as DD-MM-YY when parsable */
@@ -238,6 +245,10 @@ function nextProjectsPage() {
 
 function openProjectDetails(projectId: string) {
   emit("open-project-details", projectId);
+}
+
+function openDraftForEdit(projectId: string) {
+  emit("open-new-project", projectId);
 }
 
 const emptyStateCopy = computed(() => {
@@ -273,82 +284,185 @@ function resetAddClientForm() {
 
 function openAddClient() {
   resetAddClientForm();
+  editingClientId.value = null;
   isAddClientOpen.value = true;
 }
 
 function closeAddClient() {
   isAddClientOpen.value = false;
+  editingClientId.value = null;
 }
 
-async function createClient() {
-  const displayName = addClientForm.clientName.trim();
-  if (!displayName) return;
+function applyClientToForm(client: any) {
+  const typeValue = String(client?.type ?? "").trim().toLowerCase();
+  addClientForm.type = typeValue === "brand" ? "brand" : "individual";
+  addClientForm.brandName = String(client?.brand_name ?? "");
+  if (typeValue === "brand") {
+    addClientForm.clientName = String(client?.poc_name ?? "");
+  } else {
+    addClientForm.clientName = String(
+      client?.poc_name ?? client?.display_name ?? client?.name ?? client?.brand_name ?? "",
+    );
+  }
+  addClientForm.email = String(client?.poc_email ?? client?.email ?? "");
+  addClientForm.mobileNumber = String(
+    client?.poc_phone ?? client?.phone ?? client?.mobile_number ?? "",
+  );
+  addClientForm.status = normalizeClientStatus(client?.status);
+  addClientForm.notes = String(client?.meta?.notes ?? "");
+}
+
+async function openEditClient(clientId: string) {
+  editingClientId.value = String(clientId);
+  resetAddClientForm();
+
+  const fromList = clients.value.find((c) => String(c.id) === String(clientId));
+  if (fromList) {
+    applyClientToForm({
+      id: fromList.id,
+      type: fromList.type,
+      display_name: fromList.clientName,
+      brand_name: fromList.brandName,
+      poc_name: fromList.pocName,
+      poc_email: fromList.email,
+      poc_phone: fromList.mobileNumber,
+      email: fromList.email,
+      phone: fromList.mobileNumber,
+      status: fromList.status,
+      meta: fromList.notes ? { notes: fromList.notes } : undefined,
+    });
+  }
+
+  isAddClientOpen.value = true;
+  isClientLoading.value = true;
+  try {
+    const res = await getClientById(clientId);
+    const data = (res?.data as any)?.data ?? res?.data;
+    applyClientToForm(data);
+  } catch (error: any) {
+    console.groupCollapsed("[Clients] getClientById API error");
+    console.error(error);
+    console.log("response status:", error?.response?.status);
+    console.log("response data:", error?.response?.data);
+    console.groupEnd();
+  } finally {
+    isClientLoading.value = false;
+  }
+}
+
+async function submitClient() {
+  const rawName = addClientForm.clientName.trim();
+  const isBrand = addClientForm.type === "brand";
+  const brandNameTrim = isBrand ? addClientForm.brandName.trim() : "";
+  if (isBrand) {
+    if (!rawName && !brandNameTrim) return;
+  } else if (!rawName) {
+    return;
+  }
+
+  const displayName = isBrand ? (brandNameTrim || rawName) : rawName;
 
   const payload = {
-    type: addClientForm.type === "brand" ? ("brand" as const) : ("individual" as const),
+    type: isBrand ? ("brand" as const) : ("individual" as const),
     status: addClientForm.status,
     display_name: displayName,
-    brand_name: addClientForm.type === "brand" ? addClientForm.brandName.trim() : "",
-    email: addClientForm.email.trim(),
-    phone: addClientForm.mobileNumber.trim(),
+    brand_name: isBrand ? (brandNameTrim || rawName) : "",
+    poc_name: rawName,
+    poc_email: addClientForm.email.trim(),
+    poc_phone: addClientForm.mobileNumber.trim(),
     meta: addClientForm.notes.trim() ? { notes: addClientForm.notes.trim() } : undefined,
   };
 
-  console.groupCollapsed("[Clients] createClient payload");
+  const actionLabel = editingClientId.value ? "updateClient" : "createClient";
+  console.groupCollapsed(`[Clients] ${actionLabel} payload`);
+  if (editingClientId.value) console.log("clientId:", editingClientId.value);
   console.log(payload);
   console.groupEnd();
 
   try {
-    const response = await createClientApi(payload);
-    console.groupCollapsed("[Clients] createClient API response");
+    isClientSaving.value = true;
+    const wasEditing = Boolean(editingClientId.value);
+    const response = wasEditing
+      ? await updateClientApi(editingClientId.value!, payload, { skipAlert: true })
+      : await createClientApi(payload, { skipAlert: true });
+
+    console.groupCollapsed(
+      `[Clients] ${actionLabel} API response`,
+    );
+    if (editingClientId.value) console.log("clientId:", editingClientId.value);
     console.log("status:", response?.status);
     console.log("headers:", response?.headers);
     console.log("data:", response?.data);
     console.groupEnd();
 
-    const created = response?.data?.data ?? response?.data;
-    const createdId = String(created?.id ?? created?.uuid ?? Date.now());
-    const createdName = String(
-      created?.display_name ?? created?.name ?? created?.brand_name ?? payload.display_name,
+    const saved = (response?.data as any)?.data ?? response?.data;
+    const savedId = String(saved?.id ?? saved?.uuid ?? editingClientId.value ?? Date.now());
+    const savedName = String(
+      saved?.display_name ?? saved?.name ?? saved?.brand_name ?? payload.display_name,
     );
 
-    const anyData = response?.data as any;
-    const serverMsg = anyData?.message ?? anyData?.success_message ?? anyData?.data?.message;
-    if (!serverMsg) {
-      pushAlert({
-        kind: "success",
-        title: "Created",
-        message: `${createdName || "Client"} created successfully.`,
+    const baseRow: BaseClientRow = {
+      id: savedId,
+      type: payload.type === "brand" ? "brand" : "individual",
+      clientName: savedName,
+      brandName: String(saved?.brand_name ?? payload.brand_name ?? "").trim() || undefined,
+      pocName: String(saved?.poc_name ?? payload.poc_name ?? "").trim() || undefined,
+      email: String(saved?.poc_email ?? saved?.email ?? payload.poc_email ?? "").trim() || undefined,
+      mobileNumber: String(saved?.poc_phone ?? saved?.phone ?? payload.poc_phone ?? "").trim() || undefined,
+      status: normalizeClientStatus(saved?.status ?? payload.status),
+      notes: String(saved?.meta?.notes ?? payload.meta?.notes ?? "").trim() || undefined,
+      createdAt: String(saved?.created_at ?? new Date().toISOString()),
+    };
+
+    const idx = clients.value.findIndex((c) => String(c.id) === String(savedId));
+    if (idx >= 0) {
+      const prev = clients.value[idx];
+      clients.value[idx] = {
+        ...prev,
+        ...baseRow,
+        companyLine: companyLineFor(baseRow),
+        startedLabel: prev.startedLabel ?? formatDueDateDisplay(baseRow.createdAt),
+      };
+    } else {
+      clients.value.unshift({
+        ...baseRow,
+        companyLine: companyLineFor(baseRow),
+        totalSpendFormatted: "0",
+        projectCount: 0,
+        startedLabel: formatDueDateDisplay(baseRow.createdAt),
       });
     }
 
-    const baseRow: BaseClientRow = {
-      id: createdId,
-      type: payload.type === "brand" ? "brand" : "individual",
-      clientName: createdName,
-      brandName: String(created?.brand_name ?? payload.brand_name ?? "").trim() || undefined,
-      email: String(created?.email ?? payload.email ?? "").trim() || undefined,
-      mobileNumber: String(created?.phone ?? payload.phone ?? "").trim() || undefined,
-      status: normalizeClientStatus(created?.status ?? payload.status),
-      notes: String(created?.meta?.notes ?? payload.meta?.notes ?? "").trim() || undefined,
-      createdAt: String(created?.created_at ?? new Date().toISOString()),
-    };
-    clients.value.unshift({
-      ...baseRow,
-      companyLine:
-        baseRow.type === "brand" ? (baseRow.brandName ?? "").trim() || "—" : "Individual",
-      totalSpendFormatted: "0",
-      projectCount: 0,
-      startedLabel: formatDueDateDisplay(baseRow.createdAt),
-    });
-
     closeAddClient();
+    pushAlert({
+      kind: "success",
+      title: wasEditing ? "Client updated" : "Client added",
+      message: wasEditing
+        ? `${savedName} was updated successfully.`
+        : `${savedName} was added to your contacts.`,
+    });
   } catch (error: any) {
-    console.groupCollapsed("[Clients] createClient API error");
+    console.groupCollapsed(
+      `[Clients] ${actionLabel} API error`,
+    );
+    if (editingClientId.value) console.log("clientId:", editingClientId.value);
+    console.log("payload:", payload);
     console.error(error);
     console.log("response status:", error?.response?.status);
     console.log("response data:", error?.response?.data);
     console.groupEnd();
+    const msg =
+      extractMessage(error?.response?.data) ??
+      (typeof error?.message === "string" ? error.message : null) ??
+      "Could not save the client. Please try again.";
+    pushAlert({
+      kind: "error",
+      title: "Could not save client",
+      message: msg,
+      timeoutMs: 8000,
+    });
+  } finally {
+    isClientSaving.value = false;
   }
 }
 
@@ -359,8 +473,11 @@ function onCreateClick() {
   }
   if (activeTab.value === "clients") {
     openAddClient();
+    return;
   }
-  // draft flow TODO
+  if (activeTab.value === "draft") {
+    emit("open-new-project");
+  }
 }
 
 function selectTab(tab: "projects" | "clients" | "draft") {
@@ -385,14 +502,18 @@ function mapApiClientToBase(client: any, index: number): BaseClientRow {
   const typeValue = String(client?.type ?? "").trim().toLowerCase();
   const type: "brand" | "individual" = typeValue === "brand" ? "brand" : "individual";
   const brandName = String(client?.brand_name ?? "").trim() || undefined;
-  const email = String(client?.email ?? "").trim() || undefined;
-  const mobileNumber = String(client?.phone ?? client?.mobile_number ?? "").trim() || undefined;
+  const pocName = String(client?.poc_name ?? "").trim() || undefined;
+  const email = String(client?.poc_email ?? client?.email ?? "").trim() || undefined;
+  const mobileNumber = String(
+    client?.poc_phone ?? client?.phone ?? client?.mobile_number ?? "",
+  ).trim() || undefined;
   const realId = String(client?.id ?? client?.uuid ?? "").trim();
   return {
     id: realId || `client-${index}`,
     type,
     clientName: name,
     brandName,
+    pocName,
     email,
     mobileNumber,
     status: normalizeClientStatus(client?.status),
@@ -490,6 +611,14 @@ function normalizeProjectsResponse(raw: any): ProjectRow[] {
   return list.map((item: any) => {
     const primaryClient =
       (Array.isArray(item?.clients) ? item.clients[0] : undefined) ?? item?.client ?? null;
+    const scopeFromObject =
+      item?.project_scope && typeof item.project_scope === "object"
+        ? String(item.project_scope?.name ?? "").trim()
+        : "";
+    const scopeFromFallback = String(
+      item?.category ?? item?.scope_name ?? "",
+    ).trim();
+    const scopeLabel = scopeFromObject || scopeFromFallback || "—";
     const amount = item?.amount ?? item?.total_amount ?? item?.totalAmount ?? 0;
     const currency = item?.currency ?? item?.currency_code ?? "PKR";
     const numericAmount = Number(amount);
@@ -504,6 +633,7 @@ function normalizeProjectsResponse(raw: any): ProjectRow[] {
     return {
       id: String(item?.id ?? item?.uuid ?? crypto.randomUUID?.() ?? Date.now()),
       title: String(item?.title ?? item?.name ?? "Untitled Project"),
+      scopeLabel,
       clientName: String(
         primaryClient?.display_name ??
           item?.client_name ??
@@ -758,7 +888,10 @@ onMounted(() => {
                 @keydown.space.prevent="openProjectDetails(project.id)"
               >
                 <div class="dashboard-project-card-head">
-                  <h3 class="dashboard-project-card-title">{{ project.title }}</h3>
+                  <div class="dashboard-project-card-titles">
+                    <h3 class="dashboard-project-card-title">{{ project.title }}</h3>
+                    <p class="dashboard-project-card-scope">{{ project.scopeLabel }}</p>
+                  </div>
                   <span class="dashboard-status-pill" :class="statusClass(project.status)">
                     <span class="dashboard-status-dot" aria-hidden="true"></span>
                     {{ statusLabel(project.status) }}
@@ -808,7 +941,12 @@ onMounted(() => {
                     @click="openProjectDetails(project.id)"
                   >
                     <td>{{ (projectsPage - 1) * PROJECTS_PAGE_SIZE + index + 1 }}</td>
-                    <td>{{ project.title }}</td>
+                    <td>
+                      <div class="dashboard-project-table-titles">
+                        <div class="dashboard-project-table-title">{{ project.title }}</div>
+                        <div class="dashboard-project-table-scope">{{ project.scopeLabel }}</div>
+                      </div>
+                    </td>
                     <td>{{ project.clientName }}</td>
                     <td>{{ project.amountLabel }}</td>
                     <td>
@@ -867,7 +1005,16 @@ onMounted(() => {
             No clients found.
           </div>
           <div v-else class="dashboard-clients-card-grid">
-            <article v-for="c in filteredClients" :key="c.id" class="dashboard-client-card">
+            <article
+              v-for="c in filteredClients"
+              :key="c.id"
+              class="dashboard-client-card"
+              role="button"
+              tabindex="0"
+              @click="openEditClient(c.id)"
+              @keydown.enter="openEditClient(c.id)"
+              @keydown.space.prevent="openEditClient(c.id)"
+            >
               <div class="dashboard-client-card-top">
                 <div class="dashboard-client-card-titles">
                   <h3 class="dashboard-client-card-name">{{ c.clientName }}</h3>
@@ -951,7 +1098,42 @@ onMounted(() => {
             </article>
           </div>
         </template>
-        <p v-else class="dashboard-projects-list-placeholder">List of {{ activeTab }} will appear here.</p>
+        <template v-else>
+          <div v-if="filteredDrafts.length === 0" class="dashboard-projects-list-placeholder">
+            No drafts found.
+          </div>
+          <div v-else class="dashboard-drafts-grid">
+            <article
+              v-for="draft in filteredDrafts"
+              :key="draft.id"
+              class="dashboard-draft-card"
+              role="button"
+              tabindex="0"
+              @click="openDraftForEdit(draft.id)"
+              @keydown.enter="openDraftForEdit(draft.id)"
+              @keydown.space.prevent="openDraftForEdit(draft.id)"
+            >
+              <div class="dashboard-draft-card-head">
+                <h3 class="dashboard-draft-card-title">{{ draft.title }}</h3>
+                <span class="dashboard-status-pill dashboard-status-pill--draft">
+                  <span class="dashboard-status-dot" aria-hidden="true"></span>
+                  Draft
+                </span>
+              </div>
+              <p class="dashboard-draft-card-client">{{ draft.clientName }}</p>
+              <div class="dashboard-draft-card-meta">
+                <span class="dashboard-draft-card-meta-item">
+                  <span class="dashboard-draft-card-meta-label">Amount</span>
+                  <span class="dashboard-draft-card-meta-value">{{ draft.amountLabel }}</span>
+                </span>
+                <span class="dashboard-draft-card-meta-item">
+                  <span class="dashboard-draft-card-meta-label">Due</span>
+                  <span class="dashboard-draft-card-meta-value">{{ formatDueDateDisplay(draft.dueDate) }}</span>
+                </span>
+              </div>
+            </article>
+          </div>
+        </template>
       </div>
     </div>
 
@@ -961,17 +1143,17 @@ onMounted(() => {
       role="presentation"
       @click.self="closeAddClient"
     >
-      <div class="dashboard-modal-card" role="dialog" aria-modal="true" aria-label="Add New Client">
+      <div
+        class="dashboard-modal-card"
+        role="dialog"
+        aria-modal="true"
+        :aria-label="editingClientId ? 'Edit Client' : 'Add New Client'"
+      >
         <div class="dashboard-modal-header">
-          <div class="dashboard-modal-title">Add New Client</div>
+          <div class="dashboard-modal-title">{{ editingClientId ? "Edit Client" : "Add New Client" }}</div>
         </div>
 
-        <form class="dashboard-add-client-form" @submit.prevent="createClient">
-          <div class="dashboard-add-client-row">
-            <Label class="dashboard-add-client-label">Client</Label>
-            <Input v-model="addClientForm.clientName" placeholder="Client or Brand Name" />
-          </div>
-
+        <form class="dashboard-add-client-form" @submit.prevent="submitClient">
           <div class="dashboard-add-client-row">
             <Label class="dashboard-add-client-label">Is this a client or brand?</Label>
             <div class="dashboard-add-client-segment" role="radiogroup" aria-label="Client type">
@@ -987,8 +1169,16 @@ onMounted(() => {
           </div>
 
           <div v-if="addClientForm.type === 'brand'" class="dashboard-add-client-row">
-            <Label class="dashboard-add-client-label">Brand</Label>
+            <Label class="dashboard-add-client-label">Brand name</Label>
             <Input v-model="addClientForm.brandName" placeholder="Brand or company name" />
+          </div>
+
+          <div class="dashboard-add-client-row">
+            <Label class="dashboard-add-client-label">Client name</Label>
+            <Input
+              v-model="addClientForm.clientName"
+              :placeholder="addClientForm.type === 'brand' ? 'Contact or client name' : 'Full name'"
+            />
           </div>
 
           <div class="dashboard-add-client-grid">
@@ -1027,9 +1217,9 @@ onMounted(() => {
             <button
               type="submit"
               class="dashboard-footer-btn dashboard-footer-btn--create"
-              :disabled="!canCreateClient"
+              :disabled="!canCreateClient || isClientSaving || isClientLoading"
             >
-              Create Client
+              {{ editingClientId ? (isClientSaving ? "Updating..." : "Update Client") : isClientSaving ? "Creating..." : "Create Client" }}
             </button>
           </div>
         </form>
@@ -1275,6 +1465,99 @@ onMounted(() => {
   width: 100%;
 }
 
+.dashboard-drafts-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 16px;
+  width: 100%;
+}
+
+@media (max-width: 1100px) {
+  .dashboard-drafts-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
+@media (max-width: 640px) {
+  .dashboard-drafts-grid {
+    grid-template-columns: 1fr;
+  }
+}
+
+.dashboard-draft-card {
+  border-radius: 12px;
+  border: 1px solid #e8ecf1;
+  background: #ffffff;
+  box-shadow: 0 1px 3px rgba(15, 23, 42, 0.06);
+  padding: 16px 18px 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  cursor: pointer;
+  transition: border-color 0.18s ease, box-shadow 0.18s ease;
+}
+
+.dashboard-draft-card:hover {
+  border-color: #cbd5e1;
+  box-shadow: 0 4px 14px rgba(15, 23, 42, 0.09);
+}
+
+.dashboard-draft-card:focus-visible {
+  outline: 2px solid #1d4ed8;
+  outline-offset: 2px;
+}
+
+.dashboard-draft-card-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.dashboard-draft-card-title {
+  margin: 0;
+  font-size: 0.9375rem;
+  font-weight: 600;
+  color: #0f172a;
+  line-height: 1.35;
+  flex: 1;
+  min-width: 0;
+}
+
+.dashboard-draft-card-client {
+  margin: 0;
+  font-size: 0.8125rem;
+  color: #94a3b8;
+}
+
+.dashboard-draft-card-meta {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding-top: 10px;
+  border-top: 1px solid #f1f5f9;
+}
+
+.dashboard-draft-card-meta-item {
+  display: inline-flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.dashboard-draft-card-meta-label {
+  font-size: 0.6875rem;
+  font-weight: 500;
+  color: #94a3b8;
+}
+
+.dashboard-draft-card-meta-value {
+  font-size: 0.8125rem;
+  font-weight: 700;
+  color: #0f172a;
+}
+
 @media (max-width: 1100px) {
   .dashboard-projects-card-grid {
     grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -1317,14 +1600,48 @@ onMounted(() => {
   gap: 12px;
 }
 
+.dashboard-project-card-titles {
+  min-width: 0;
+  flex: 1;
+}
+
 .dashboard-project-card-title {
   margin: 0;
   font-size: 0.9375rem;
   font-weight: 600;
   color: #0f172a;
   line-height: 1.35;
-  flex: 1;
   min-width: 0;
+}
+
+.dashboard-project-card-scope {
+  margin: 4px 0 0;
+  font-size: 0.75rem;
+  color: #64748b;
+  line-height: 1.25;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.dashboard-project-table-titles {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+}
+
+.dashboard-project-table-title {
+  font-weight: 600;
+  color: #0f172a;
+}
+
+.dashboard-project-table-scope {
+  font-size: 0.75rem;
+  color: #64748b;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 320px;
 }
 
 .dashboard-project-card .dashboard-status-pill {
@@ -1536,23 +1853,23 @@ onMounted(() => {
   background: #22c55e;
 }
 
-.dashboard-status-pill--in-dispute {
+.dashboard-status-pill--in_dispute {
   background: #fef2f2;
   border-color: #fecaca;
   color: #dc2626;
 }
 
-.dashboard-status-pill--in-dispute .dashboard-status-dot {
+.dashboard-status-pill--in_dispute .dashboard-status-dot {
   background: #ef4444;
 }
 
-.dashboard-status-pill--payment-due {
+.dashboard-status-pill--payment_due {
   background: #fef2f2;
   border-color: #fecaca;
   color: #b91c1c;
 }
 
-.dashboard-status-pill--payment-due .dashboard-status-dot {
+.dashboard-status-pill--payment_due .dashboard-status-dot {
   background: #f87171;
 }
 
@@ -1566,14 +1883,24 @@ onMounted(() => {
   background: #94a3b8;
 }
 
-.dashboard-status-pill--in-progress {
+.dashboard-status-pill--in_progress {
   background: #eff6ff;
   border-color: #bfdbfe;
   color: #1d4ed8;
 }
 
-.dashboard-status-pill--in-progress .dashboard-status-dot {
+.dashboard-status-pill--in_progress .dashboard-status-dot {
   background: #3b82f6;
+}
+
+.dashboard-status-pill--discussion {
+  background: #f5f3ff;
+  border-color: #ddd6fe;
+  color: #5b21b6;
+}
+
+.dashboard-status-pill--discussion .dashboard-status-dot {
+  background: #8b5cf6;
 }
 
 .dashboard-status-pill--draft {

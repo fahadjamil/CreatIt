@@ -1,3 +1,4 @@
+import { clearStoredUserProfile } from "@/lib/userProfile";
 const AUTH_STORAGE_KEY = "createit_auth_session";
 const AUTH_ACCESS_TOKEN_KEY = "createit_access_token";
 const AUTH_COOKIE_MAX_AGE_SECONDS = 60 * 60 * 24 * 7;
@@ -57,13 +58,23 @@ const setAuthSession = (session) => {
 const clearAuthSession = () => {
     clearCookie(AUTH_STORAGE_KEY);
     clearCookie(AUTH_ACCESS_TOKEN_KEY);
+    clearStoredUserProfile();
 };
-const isAuthenticated = () => {
-    const session = getAuthSession();
-    if (!session)
-        return false;
-    return Boolean(session.token || session.accessToken || session.user);
+/** After 401 on a request that sent Bearer auth: clear storage and go to login. */
+const redirectToLoginAfterSessionExpired = () => {
+    clearAuthSession();
+    if (typeof window === "undefined")
+        return;
+    const { pathname, search } = window.location;
+    const onGuestRoute = pathname === "/" || pathname.startsWith("/auth/");
+    if (onGuestRoute) {
+        window.location.replace("/auth/login");
+        return;
+    }
+    window.location.replace(`/auth/login?redirect=${encodeURIComponent(`${pathname}${search}`)}`);
 };
+/** True only when we have a non-empty token to send (session or access-token cookie). */
+const isAuthenticated = () => Boolean(getAuthToken());
 /**
  * Login/register endpoints sometimes return tokens at different nesting levels.
  * Keep this parsing in one place so pages stay simple.
@@ -87,4 +98,4 @@ const extractAuthTokens = (responseData) => {
         refreshToken: typeof refreshToken === "string" && refreshToken.trim() ? refreshToken.trim() : null,
     };
 };
-export { AUTH_STORAGE_KEY, AUTH_ACCESS_TOKEN_KEY, getAuthSession, getAuthToken, setAuthSession, clearAuthSession, isAuthenticated, extractAuthTokens, };
+export { AUTH_STORAGE_KEY, AUTH_ACCESS_TOKEN_KEY, getAuthSession, getAuthToken, setAuthSession, clearAuthSession, redirectToLoginAfterSessionExpired, isAuthenticated, extractAuthTokens, };

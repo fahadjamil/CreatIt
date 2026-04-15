@@ -17,11 +17,7 @@
         class="auth-back-link auth-back-link--card"
         to="/auth/login"
       >
-        <img
-          class="auth-back-icon"
-          src="@/assets/icons/BackIcon.png"
-          alt=""
-        />
+        <img class="auth-back-icon" src="@/assets/icons/BackIcon.png" alt="" />
         Back to login
       </RouterLink>
       <button
@@ -30,11 +26,7 @@
         type="button"
         @click="goToStep(step - 1)"
       >
-        <img
-          class="auth-back-icon"
-          src="@/assets/icons/BackIcon.png"
-          alt=""
-        />
+        <img class="auth-back-icon" src="@/assets/icons/BackIcon.png" alt="" />
         Back
       </button>
 
@@ -86,7 +78,11 @@
           :disabled="isSendingCode"
           @click="sendPhoneVerificationCode"
         >
-          <span v-if="isSendingCode" class="auth-button-loader" aria-hidden="true"></span>
+          <span
+            v-if="isSendingCode"
+            class="auth-button-loader"
+            aria-hidden="true"
+          ></span>
           {{ isSendingCode ? "Sending..." : "Continue" }}
         </button>
         <p class="auth-consent">
@@ -164,14 +160,21 @@
           :disabled="isSendingCode"
           @click="sendPhoneVerificationCode"
         >
-          <span v-if="isSendingCode" class="auth-button-loader auth-button-loader--small" aria-hidden="true"></span>
+          <span
+            v-if="isSendingCode"
+            class="auth-button-loader auth-button-loader--small"
+            aria-hidden="true"
+          ></span>
           {{ isSendingCode ? "Resending..." : "Resend code" }}
         </button>
         <button class="auth-button" type="button" @click="goToStep(3)">
           Submit Code
         </button>
       </div>
-      <div v-else-if="step === 3" class="auth-card auth-card--compact auth-card--left">
+      <div
+        v-else-if="step === 3"
+        class="auth-card auth-card--compact auth-card--left"
+      >
         <img
           class="auth-illustration-image"
           src="@/assets/icons/Single-Neutral-Id-Card-3--Streamline-Ultimate.png"
@@ -206,7 +209,10 @@
           Next
         </button>
       </div>
-      <div v-else-if="step === 4" class="auth-card auth-card--compact auth-card--left">
+      <div
+        v-else-if="step === 4"
+        class="auth-card auth-card--compact auth-card--left"
+      >
         <img
           class="auth-illustration-image"
           src="@/assets/icons/Send-Email-2--Streamline-Ultimate.png"
@@ -235,7 +241,10 @@
           Next
         </button>
       </div>
-      <div v-else-if="step === 5" class="auth-card auth-card--compact auth-card--left">
+      <div
+        v-else-if="step === 5"
+        class="auth-card auth-card--compact auth-card--left"
+      >
         <img
           class="auth-illustration-image"
           src="@/assets/icons/Password-Lock-1--Streamline-Ultimate.png"
@@ -255,13 +264,12 @@
             type="password"
             placeholder="Your Password"
           />
-          <button class="auth-input-icon" type="button" aria-label="Show password">
-            <svg
-              viewBox="0 0 24 24"
-              width="18"
-              height="18"
-              aria-hidden="true"
-            >
+          <button
+            class="auth-input-icon"
+            type="button"
+            aria-label="Show password"
+          >
+            <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true">
               <path
                 d="M12 5c-5 0-9 5-9 7s4 7 9 7 9-5 9-7-4-7-9-7zm0 11a4 4 0 1 1 0-8 4 4 0 0 1 0 8z"
                 fill="currentColor"
@@ -284,19 +292,16 @@
             type="button"
             aria-label="Show password confirmation"
           >
-            <svg
-              viewBox="0 0 24 24"
-              width="18"
-              height="18"
-              aria-hidden="true"
-            >
+            <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true">
               <path
                 d="M12 5c-5 0-9 5-9 7s4 7 9 7 9-5 9-7-4-7-9-7zm0 11a4 4 0 1 1 0-8 4 4 0 0 1 0 8z"
                 fill="currentColor"
               />
             </svg>
           </button>
-          <p v-if="passwordError" class="auth-field-error">{{ passwordError }}</p>
+          <p v-if="passwordError" class="auth-field-error">
+            {{ passwordError }}
+          </p>
         </label>
 
         <div class="auth-security">
@@ -304,17 +309,22 @@
           <ul class="auth-security-list">
             <li class="auth-security-item">A minimum of 8 characters</li>
             <li class="auth-security-item">At least one number</li>
-            <li class="auth-security-item">
-              A special character (!@#$%&*?-_)
-            </li>
+            <li class="auth-security-item">A special character (!@#$%&*?-_)</li>
           </ul>
         </div>
 
-        <button class="auth-button" type="button" @click="goToSecureAccountNext">
+        <button
+          class="auth-button"
+          type="button"
+          @click="goToSecureAccountNext"
+        >
           Next
         </button>
       </div>
-      <div v-else-if="step === 6" class="auth-card auth-card--compact auth-card--left">
+      <div
+        v-else-if="step === 6"
+        class="auth-card auth-card--compact auth-card--left"
+      >
         <img
           class="auth-illustration-image"
           src="@/assets/icons/edit writiting.png"
@@ -386,7 +396,10 @@
           Next
         </button>
       </div>
-      <div v-else-if="step === 7" class="auth-card auth-card--compact auth-card--left">
+      <div
+        v-else-if="step === 7"
+        class="auth-card auth-card--compact auth-card--left"
+      >
         <h1 class="auth-title">Your skills</h1>
         <p class="auth-subtitle">
           Understanding what you do helps us give better<br />
@@ -468,10 +481,16 @@
           :disabled="isSubmitting"
           @click="submitRegistration"
         >
-          <span v-if="isSubmitting" class="auth-button-loader" aria-hidden="true"></span>
+          <span
+            v-if="isSubmitting"
+            class="auth-button-loader"
+            aria-hidden="true"
+          ></span>
           {{ isSubmitting ? "Submitting..." : "Go To Dashboard" }}
         </button>
-        <button class="auth-button" type="button" @click="goToWalletSetup">Create My Wallet</button>
+        <button class="auth-button" type="button" @click="goToWalletSetup">
+          Create My Wallet
+        </button>
       </div>
     </div>
 
@@ -509,10 +528,12 @@
 <script setup>
 import { computed, onUnmounted, ref } from "vue";
 import { useRouter } from "vue-router";
+import { useAlerts } from "@/composables/useAlerts";
 import { registerUser, requestPhoneVerificationCode } from "@/lib/api";
 import { getRegisterDevicePayload } from "@/lib/device";
 
 const router = useRouter();
+const { pushAlert } = useAlerts();
 
 const step = ref(1);
 const skillQuery = ref("");
@@ -819,11 +840,11 @@ const contentCreationSkillSet = new Set([
 const socialMediaSkillSet = new Set(["Instagram Marketing", "TikTok Creation"]);
 
 const fullName = computed(() =>
-  [firstName.value.trim(), lastName.value.trim()].filter(Boolean).join(" ")
+  [firstName.value.trim(), lastName.value.trim()].filter(Boolean).join(" "),
 );
 
 const phoneVerificationCode = computed(() =>
-  verificationDigits.value.map((digit) => digit.trim()).join("")
+  verificationDigits.value.map((digit) => digit.trim()).join(""),
 );
 
 const selectedCountry = computed(() => {
@@ -832,7 +853,7 @@ const selectedCountry = computed(() => {
 });
 
 const countryDialCode = computed(
-  () => selectedCountry.value?.dial_code ?? "+61"
+  () => selectedCountry.value?.dial_code ?? "+61",
 );
 
 const fullPhoneNumber = computed(() => {
@@ -1052,22 +1073,18 @@ const submitRegistration = async () => {
       email: email.value,
       password: password.value,
       password_confirmation: passwordConfirmation.value,
-      device: getRegisterDevicePayload(),
-      kyc: {
-        account_type: accountType.value,
-        skills: {
-          content_creation: selected.filter((skill) =>
-            contentCreationSkillSet.has(skill)
-          ),
-          social_media: selected.filter((skill) =>
-            socialMediaSkillSet.has(skill)
-          ),
-        },
+      account_type: accountType.value,
+      skills: {
+        content_creation: selected.filter((skill) =>
+          contentCreationSkillSet.has(skill),
+        ),
+        
       },
+      device: getRegisterDevicePayload(),
     };
 
     console.log("Registration payload:", payload);
-    const registerResponse = await registerUser(payload);
+    const registerResponse = await registerUser(payload, { skipAlert: true });
     console.log("Registration response:", registerResponse?.data);
     const customerData = {
       phone_number: fullPhoneNumber.value,
@@ -1080,21 +1097,26 @@ const submitRegistration = async () => {
       account_type: accountType.value,
       skills: {
         content_creation: selected.filter((skill) =>
-          contentCreationSkillSet.has(skill)
+          contentCreationSkillSet.has(skill),
         ),
         social_media: selected.filter((skill) =>
-          socialMediaSkillSet.has(skill)
+          socialMediaSkillSet.has(skill),
         ),
       },
     };
     try {
       sessionStorage.setItem(
         "createit_signup_customer_data",
-        JSON.stringify(customerData, null, 2)
+        JSON.stringify(customerData, null, 2),
       );
     } catch (e) {
       /* ignore storage errors */
     }
+    pushAlert({
+      kind: "success",
+      title: "Account created",
+      message: "You can now sign in with your email and password.",
+    });
     router.push("/auth/login");
   } catch (error) {
     console.error("Registration failed", error);

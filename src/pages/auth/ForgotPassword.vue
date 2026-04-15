@@ -47,13 +47,21 @@
           <input
             v-model="email"
             class="auth-input"
+            :class="{ 'auth-input--error': emailError }"
             type="email"
             placeholder="email@gmail.com"
+            @input="emailError = ''"
           />
+          <p v-if="emailError" class="auth-field-error">{{ emailError }}</p>
         </label>
 
-        <button class="auth-button" type="button" @click="goToStep(2)">
-          Submit
+        <button class="auth-button" type="button" :disabled="isSubmitting" @click="submitForgotPassword">
+          <span
+            v-if="isSubmitting"
+            class="auth-button-loader"
+            aria-hidden="true"
+          ></span>
+          {{ isSubmitting ? "Submitting..." : "Submit" }}
         </button>
       </div>
       <div v-else class="auth-card auth-card--compact">
@@ -80,11 +88,46 @@
 
 <script setup>
 import { ref } from "vue";
+import { requestForgotPassword } from "@/lib/api";
 
 const step = ref(1);
 const email = ref("");
+const emailError = ref("");
+const isSubmitting = ref(false);
+
+const isValidEmail = (value) => {
+  const trimmed = (value || "").trim();
+  if (!trimmed) return false;
+  const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+  return emailRegex.test(trimmed);
+};
 
 const goToStep = (nextStep) => {
   step.value = nextStep;
+};
+
+const submitForgotPassword = async () => {
+  if (isSubmitting.value) return;
+
+  emailError.value = "";
+  const trimmed = (email.value || "").trim();
+  if (!trimmed) {
+    emailError.value = "Please enter your email address.";
+    return;
+  }
+  if (!isValidEmail(trimmed)) {
+    emailError.value = "Please enter a valid email address.";
+    return;
+  }
+
+  isSubmitting.value = true;
+  try {
+    await requestForgotPassword({ email: trimmed });
+    goToStep(2);
+  } catch (error) {
+    // Alerts are handled globally in the API client.
+  } finally {
+    isSubmitting.value = false;
+  }
 };
 </script>

@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed, onMounted, ref } from "vue";
-import { getProjects } from "@/lib/api";
+import { getDashboard } from "@/lib/api";
+import { projectStatusLabel, projectStatusVariant } from "@/lib/projectStatus";
 
 const emit = defineEmits<{
   (e: "view-projects"): void;
@@ -10,10 +11,12 @@ const emit = defineEmits<{
 
 const isLoading = ref(false);
 const projectsCount = ref(0);
+const currentBalance = ref<number | null>(null);
 
 type ProjectCard = {
   id: string;
   title: string;
+  scopeLabel: string;
   clientName: string;
   amount: number;
   amountFormatted: string;
@@ -37,8 +40,10 @@ const visibleProjects = computed(() => {
 });
 
 const availableBalance = computed(() => {
-  const total = projects.value.reduce((sum, p) => sum + (Number.isFinite(p.amount) ? p.amount : 0), 0);
-  return total;
+  if (typeof currentBalance.value === "number" && Number.isFinite(currentBalance.value)) {
+    return currentBalance.value;
+  }
+  return projects.value.reduce((sum, p) => sum + (Number.isFinite(p.amount) ? p.amount : 0), 0);
 });
 
 const availableBalanceFormatted = computed(() => {
@@ -69,29 +74,11 @@ function formatDueDateDisplay(raw: string): string {
 }
 
 function statusLabel(status: string): string {
-  const value = String(status ?? "")
-    .trim()
-    .toLowerCase();
-  if (value.includes("in_progress") || value.includes("in-progress")) return "In Progress";
-  if (value.includes("draft")) return "Draft";
-  if (value.includes("complete")) return "Completed";
-  if (value.includes("dispute")) return "In Dispute";
-  if (value.includes("delay")) return "Delayed";
-  if (value.includes("payment") && (value.includes("due") || value.includes("overdue"))) return "Payment Due";
-  return "Signed";
+  return projectStatusLabel(status);
 }
 
 function statusVariant(status: string): string {
-  const value = String(status ?? "")
-    .trim()
-    .toLowerCase();
-  if (value.includes("payment") && (value.includes("due") || value.includes("overdue"))) return "payment-due";
-  if (value.includes("delay")) return "delayed";
-  if (value.includes("in_progress") || value.includes("in-progress")) return "in-progress";
-  if (value.includes("draft")) return "draft";
-  if (value.includes("complete")) return "completed";
-  if (value.includes("dispute")) return "in-dispute";
-  return "signed";
+  return projectStatusVariant(status);
 }
 
 function setCarouselPage(next: number) {
@@ -107,40 +94,60 @@ function nextCarouselPage() {
 }
 
 function normalizeProjectsResponse(raw: any): ProjectCard[] {
-  const list = Array.isArray(raw?.data?.data)
-    ? raw.data.data
-    : Array.isArray(raw?.data)
-      ? raw.data
-      : Array.isArray(raw)
-        ? raw
-        : [];
+  const list = Array.isArray(raw?.data?.projects)
+    ? raw.data.projects
+    : Array.isArray(raw?.projects)
+      ? raw.projects
+      : Array.isArray(raw?.data?.data)
+        ? raw.data.data
+        : Array.isArray(raw?.data)
+          ? raw.data
+          : Array.isArray(raw)
+            ? raw
+            : [];
 
   return list.map((item: any) => {
     const primaryClient =
       (Array.isArray(item?.clients) ? item.clients[0] : undefined) ?? item?.client ?? null;
-    const amount = item?.amount ?? item?.total_amount ?? item?.totalAmount ?? 0;
+    const scopeFromObject =
+      item?.project_scope && typeof item.project_scope === "object"
+        ? String(item.project_scope?.name ?? "").trim()
+        : "";
+    const scopeFromFallback = String(
+      item?.category ?? item?.scope_name ?? "",
+    ).trim();
+    const scopeLabel = scopeFromObject || scopeFromFallback || "—";
+    const amount = item?.project_amount ?? item?.amount ?? item?.total_amount ?? item?.totalAmount ?? 0;
     const numericAmount = Number(amount);
     const amountFormatted = Number.isFinite(numericAmount)
       ? numericAmount.toLocaleString("en-PK")
       : String(amount ?? "0");
 
-    const dueDate = String(item?.end_date ?? item?.due_date ?? "—");
+    const dueDate = String(item?.project_end_date ?? item?.end_date ?? item?.due_date ?? "—");
 
     return {
-      id: String(item?.id ?? item?.uuid ?? crypto.randomUUID?.() ?? Date.now()),
-      title: String(item?.title ?? item?.name ?? "Untitled Project"),
+      id: String(
+        item?.id ??
+          item?.uuid ??
+          item?.project_id ??
+          item?.project_name ??
+          crypto.randomUUID?.() ??
+          Date.now(),
+      ),
+      title: String(item?.project_name ?? item?.title ?? item?.name ?? "Untitled Project"),
+      scopeLabel,
       clientName: String(
-        primaryClient?.display_name ??
-          item?.client_name ??
+        item?.client_name ??
+          primaryClient?.display_name ??
           primaryClient?.name ??
           primaryClient?.brand_name ??
           "—",
       ),
       amount: Number.isFinite(numericAmount) ? numericAmount : 0,
       amountFormatted,
-      paymentType: String(item?.type ?? item?.payment_type ?? "single"),
+      paymentType: String(item?.project_type ?? item?.type ?? item?.payment_type ?? "single"),
       dueDateDisplay: formatDueDateDisplay(dueDate),
-      status: String(item?.status ?? "draft"),
+      status: String(item?.project_status ?? item?.status ?? "draft"),
     };
   });
 }
@@ -148,14 +155,20 @@ function normalizeProjectsResponse(raw: any): ProjectCard[] {
 async function loadProjectsCount() {
   isLoading.value = true;
   try {
-    const response = await getProjects();
-    const list = normalizeProjectsResponse(response?.data);
+    const response = await getDashboard();
+    const payload = (response?.data as any)?.data ?? response?.data;
+    const rawBalance = payload?.current_balance;
+    const parsedBalance = Number(rawBalance);
+    currentBalance.value = Number.isFinite(parsedBalance) ? parsedBalance : null;
+
+    const list = normalizeProjectsResponse(payload);
     projects.value = list;
     projectsCount.value = list.length;
     setCarouselPage(0);
   } catch (e) {
     projectsCount.value = 0;
     projects.value = [];
+    currentBalance.value = null;
     setCarouselPage(0);
   } finally {
     isLoading.value = false;
@@ -247,7 +260,10 @@ onMounted(() => {
             class="dashboard-home-project-card"
           >
             <div class="dashboard-home-project-head">
-              <h3 class="dashboard-home-project-title">{{ project.title }}</h3>
+              <div class="dashboard-home-project-titles">
+                <h3 class="dashboard-home-project-title">{{ project.title }}</h3>
+                <p class="dashboard-home-project-scope">{{ project.scopeLabel }}</p>
+              </div>
               <span class="dashboard-home-status-pill" :data-variant="statusVariant(project.status)">
                 <span class="dashboard-home-status-dot" aria-hidden="true"></span>
                 {{ statusLabel(project.status) }}
@@ -430,14 +446,28 @@ onMounted(() => {
   gap: 12px;
 }
 
+.dashboard-home-project-titles {
+  min-width: 0;
+  flex: 1;
+}
+
 .dashboard-home-project-title {
   margin: 0;
   font-size: 0.9375rem;
   font-weight: 600;
   color: #0f172a;
   line-height: 1.35;
-  flex: 1;
   min-width: 0;
+}
+
+.dashboard-home-project-scope {
+  margin: 4px 0 0;
+  font-size: 0.75rem;
+  color: #64748b;
+  line-height: 1.25;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .dashboard-home-project-client {
@@ -537,23 +567,23 @@ onMounted(() => {
   background: #22c55e;
 }
 
-.dashboard-home-status-pill[data-variant="in-dispute"] {
+.dashboard-home-status-pill[data-variant="in_dispute"] {
   background: #fef2f2;
   border-color: #fecaca;
   color: #dc2626;
 }
 
-.dashboard-home-status-pill[data-variant="in-dispute"] .dashboard-home-status-dot {
+.dashboard-home-status-pill[data-variant="in_dispute"] .dashboard-home-status-dot {
   background: #ef4444;
 }
 
-.dashboard-home-status-pill[data-variant="payment-due"] {
+.dashboard-home-status-pill[data-variant="payment_due"] {
   background: #fef2f2;
   border-color: #fecaca;
   color: #b91c1c;
 }
 
-.dashboard-home-status-pill[data-variant="payment-due"] .dashboard-home-status-dot {
+.dashboard-home-status-pill[data-variant="payment_due"] .dashboard-home-status-dot {
   background: #f87171;
 }
 
@@ -567,14 +597,24 @@ onMounted(() => {
   background: #94a3b8;
 }
 
-.dashboard-home-status-pill[data-variant="in-progress"] {
+.dashboard-home-status-pill[data-variant="in_progress"] {
   background: #eff6ff;
   border-color: #bfdbfe;
   color: #1d4ed8;
 }
 
-.dashboard-home-status-pill[data-variant="in-progress"] .dashboard-home-status-dot {
+.dashboard-home-status-pill[data-variant="in_progress"] .dashboard-home-status-dot {
   background: #3b82f6;
+}
+
+.dashboard-home-status-pill[data-variant="discussion"] {
+  background: #f5f3ff;
+  border-color: #ddd6fe;
+  color: #5b21b6;
+}
+
+.dashboard-home-status-pill[data-variant="discussion"] .dashboard-home-status-dot {
+  background: #8b5cf6;
 }
 
 .dashboard-home-status-pill[data-variant="draft"] {

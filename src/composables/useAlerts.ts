@@ -1,6 +1,7 @@
-import { computed, reactive } from "vue";
+import { computed } from "vue";
+import { showColoredToast, type ToastKind } from "@/lib/swToast";
 
-export type AlertKind = "success" | "error" | "info";
+export type AlertKind = ToastKind;
 
 export type AppAlert = {
   id: string;
@@ -14,42 +15,27 @@ type PushAlertInput = Omit<AppAlert, "id" | "createdAt"> & {
   timeoutMs?: number;
 };
 
-const state = reactive({
-  alerts: [] as AppAlert[],
-});
-
-const makeId = () => `${Date.now()}-${Math.random().toString(16).slice(2)}`;
-
+/** Legacy: in-app banner list is unused; all alerts use SweetAlert2 colored toasts. */
 export function useAlerts() {
-  const alerts = computed(() => state.alerts);
+  const alerts = computed(() => [] as AppAlert[]);
 
-  const removeAlert = (id: string) => {
-    const idx = state.alerts.findIndex((a) => a.id === id);
-    if (idx >= 0) state.alerts.splice(idx, 1);
+  const removeAlert = (_id: string) => {
+    /* no-op: toasts are not stored in-app */
   };
 
   const clearAlerts = () => {
-    state.alerts.splice(0, state.alerts.length);
+    /* no-op */
   };
 
   const pushAlert = (input: PushAlertInput) => {
-    const alert: AppAlert = {
-      id: makeId(),
+    void showColoredToast({
       kind: input.kind,
       title: input.title,
       message: input.message,
-      createdAt: Date.now(),
-    };
-    state.alerts.unshift(alert);
-
-    const timeoutMs = input.timeoutMs ?? (input.kind === "error" ? 7000 : 4500);
-    if (timeoutMs > 0) {
-      window.setTimeout(() => removeAlert(alert.id), timeoutMs);
-    }
-
-    return alert.id;
+      timeoutMs: input.timeoutMs,
+    });
+    return `toast-${Date.now()}`;
   };
 
   return { alerts, pushAlert, removeAlert, clearAlerts };
 }
-

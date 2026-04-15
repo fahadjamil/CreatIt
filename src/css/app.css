@@ -22,6 +22,33 @@ body {
   min-height: 100vh;
 }
 
+/* Base styling for reka-ui dialogs (works without Tailwind utilities) */
+[data-slot="dialog-overlay"] {
+  position: fixed;
+  inset: 0;
+  z-index: 470;
+  background: rgba(15, 23, 42, 0.45);
+  backdrop-filter: blur(2px);
+}
+
+[data-slot="dialog-content"] {
+  position: fixed;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  z-index: 480;
+  width: min(560px, calc(100vw - 2rem));
+  max-height: calc(100vh - 2rem);
+  overflow: auto;
+  /* Solid surface so the panel never appears transparent over the overlay */
+  background-color: #f8f9fa !important;
+  border: 1px solid #e8e8ec;
+  border-radius: 16px;
+  box-shadow:
+    0 0 0 1px rgba(15, 23, 42, 0.06),
+    0 24px 48px -12px rgba(15, 23, 42, 0.22);
+}
+
 .app-shell {
   display: grid;
   grid-template-columns: 240px 1fr;
@@ -854,17 +881,21 @@ body {
 }
 
 .dashboard-shell {
-  display: grid;
-  grid-template-columns: 240px 1fr;
   min-height: 100vh;
+  height: 100vh;
   background: #f5f7fb;
 }
 
-.dashboard-shell--collapsed {
-  grid-template-columns: 72px 1fr;
-}
-
 .dashboard-sidebar {
+  position: fixed;
+  top: 0;
+  left: 0;
+  z-index: 30;
+  box-sizing: border-box;
+  width: 240px;
+  height: 100vh;
+  height: 100dvh;
+  overflow: hidden;
   background: #ffffff;
   border-right: 1px solid #e5e7eb;
   padding: 20px 16px;
@@ -874,6 +905,7 @@ body {
 }
 
 .dashboard-sidebar--collapsed {
+  width: 72px;
   padding: 20px 12px;
 }
 
@@ -994,21 +1026,143 @@ body {
 }
 
 .dashboard-main {
+  margin-left: 240px;
   display: flex;
   flex-direction: column;
   min-width: 0;
+  min-height: 0;
+  height: 100vh;
+  height: 100dvh;
+  align-self: stretch;
+}
+
+.dashboard-shell--collapsed .dashboard-main {
+  margin-left: 72px;
+}
+
+.dashboard-content--invoice {
+  overflow-y: auto;
+  align-content: start;
 }
 
 .dashboard-topbar {
   display: flex;
   justify-content: flex-end;
-  padding: 18px 28px 0;
+  align-items: center;
+  padding: 14px 28px;
+  background: #ffffff;
+  border-bottom: 1px solid #e5e7eb;
 }
 
 .dashboard-topbar-actions {
   display: flex;
   align-items: center;
-  gap: 12px;
+  gap: 16px;
+}
+
+.dashboard-create-menu-trigger {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 16px;
+  min-height: 40px;
+  border: none;
+  border-radius: 999px;
+  background: #0f172a;
+  color: #ffffff;
+  cursor: pointer;
+  transition: background 0.15s ease, opacity 0.15s ease;
+}
+
+.dashboard-create-menu-trigger:hover {
+  background: #1e293b;
+}
+
+.dashboard-create-menu-trigger:focus-visible {
+  outline: 2px solid #3b82f6;
+  outline-offset: 2px;
+}
+
+.dashboard-create-menu-trigger-icon {
+  flex-shrink: 0;
+  color: #ffffff;
+}
+
+.dashboard-create-menu-content {
+  min-width: 220px;
+  padding: 8px;
+  border-radius: 14px;
+  border: 1px solid #e5e7eb;
+  box-shadow: 0 10px 40px rgba(15, 23, 42, 0.12);
+  /* Solid panel: theme `bg-popover` can be missing or translucent, so lines behind show through */
+  background-color: #ffffff !important;
+  background-image: none;
+  backdrop-filter: none;
+}
+
+.dashboard-create-menu-item {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  padding: 10px 12px;
+  border-radius: 10px;
+  font-size: 0.9375rem;
+  font-weight: 500;
+  color: #111827;
+  cursor: pointer;
+}
+
+.dashboard-create-menu-item:hover,
+.dashboard-create-menu-item:focus {
+  background: #f0f2f5 !important;
+  color: #111827 !important;
+}
+
+.dashboard-topbar-notify {
+  position: relative;
+  display: grid;
+  place-items: center;
+  width: 40px;
+  height: 40px;
+  padding: 0;
+  border: none;
+  background: transparent;
+  color: #6b7280;
+  cursor: pointer;
+  border-radius: 999px;
+  transition: background 0.15s ease, color 0.15s ease;
+}
+
+.dashboard-topbar-notify:hover {
+  background: #f3f4f6;
+  color: #374151;
+}
+
+.dashboard-topbar-notify:focus-visible {
+  outline: 2px solid #3b82f6;
+  outline-offset: 2px;
+}
+
+.dashboard-topbar-notify-icon {
+  flex-shrink: 0;
+}
+
+.dashboard-topbar-notify-badge {
+  position: absolute;
+  top: 6px;
+  right: 6px;
+  min-width: 18px;
+  height: 18px;
+  padding: 0 5px;
+  border-radius: 999px;
+  background: #ef4444;
+  color: #ffffff;
+  font-size: 0.6875rem;
+  font-weight: 600;
+  line-height: 18px;
+  text-align: center;
+  border: 2px solid #ffffff;
+  box-sizing: border-box;
 }
 
 .dashboard-icon-button {
@@ -1041,22 +1195,47 @@ body {
   border: 2px solid #0f172a;
 }
 
-.dashboard-avatar {
-  width: 28px;
-  height: 28px;
-  border-radius: 999px;
-  background: #e2e8f0;
+.dashboard-profile {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.dashboard-profile-name {
+  font-size: 0.8rem;
+  font-weight: 600;
   color: #0f172a;
-  font-size: 0.7rem;
+  max-width: 160px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.dashboard-avatar {
+  flex-shrink: 0;
+  width: 40px;
+  height: 40px;
+  border-radius: 999px;
+  background: #e5e7eb;
+  color: #0f172a;
+  font-size: 0.8125rem;
   display: grid;
   place-items: center;
   font-weight: 600;
+  letter-spacing: -0.02em;
 }
 
 .dashboard-content {
   padding: 16px 28px 28px;
   display: grid;
   gap: 20px;
+  flex: 1;
+  min-height: 0;
+}
+
+.dashboard-content.dashboard-content--invoice {
+  padding: 16px 16px 28px;
 }
 
 .dashboard-card {

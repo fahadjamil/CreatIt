@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, reactive, ref } from "vue";
+import { computed, nextTick, onMounted, reactive, ref, watch } from "vue";
 import { Button } from "@/components/ui/button";
 import { Label } from "@/components/ui/label";
 import { Input } from "@/components/ui/input";
@@ -8,12 +8,25 @@ import {
   createProject,
   createProjectMilestone,
   createTag,
+  getClientById,
+  getClients,
+  getProjectById,
+  getProjectRecurrenceOptions,
   getProjectScopes,
   getTags,
+  uploadImages,
   updateProject,
 } from "@/lib/api";
 import { useAlerts } from "@/composables/useAlerts";
+import { compressImageFile } from "@/lib/imageCompression";
+import { resolveImageRecordSource, resolveStorageUrl } from "@/lib/storageUrl";
+import {
+  normalizeProjectStatus,
+  projectStatusLabel as projectStatusLabelText,
+  type ProjectStatus,
+} from "@/lib/projectStatus";
 
+const props = defineProps<{ projectId?: string }>();
 const emit = defineEmits<{ (e: "close"): void; (e: "complete"): void }>();
 
 const { pushAlert } = useAlerts();
@@ -27,7 +40,6 @@ const didCreateMilestones = ref(false);
 
 // Step 1 form state
 const projectName = ref("");
-const projectType = ref("");
 const clientName = ref("");
 const clientOrBrand = ref<"brand" | "individual">("brand");
 // Default new projects should start as "in_progress"
@@ -39,6 +51,90 @@ const endDate = ref("");
 const scopeDescription = ref("");
 const selectedProjectScopeId = ref("");
 const uploadedFiles = ref<{ name: string; type: string; file: File }[]>([]);
+type ExistingMediaItem = { key: string; id: string; path: string; url: string; isRealId: boolean };
+const existingMedia = ref<ExistingMediaItem[]>([]);
+const uploadedImageIds = ref<string[]>([]);
+const imagesUploadFingerprint = ref<string>("");
+const isUploadingImages = ref(false);
+
+function normalizeExistingMedia(raw: unknown): ExistingMediaItem[] {
+  const list = Array.isArray(raw) ? raw : [];
+  return list
+    .map((img: any, idx: number) => {
+      const source = resolveImageRecordSource(img);
+      const id = String(img?.id ?? img?.uuid ?? "").trim();
+      return {
+        key: id || (source ? `src:${source}` : `idx:${idx}`),
+        id,
+        path: source,
+        url: resolveStorageUrl(source),
+        isRealId: Boolean(id),
+      };
+    })
+    .filter((x) => Boolean(x.path));
+}
+
+function fingerprintSelectedFiles(): string {
+  if (!uploadedFiles.value.length) return "";
+  return uploadedFiles.value
+    .map((f) => `${f.file.name}:${f.file.size}:${f.file.lastModified}`)
+    .join("|");
+}
+
+function clearPendingUploads() {
+  uploadedImageIds.value = [];
+  imagesUploadFingerprint.value = "";
+}
+
+async function ensureUploadedImageIds(): Promise<void> {
+  if (!uploadedFiles.value.length) {
+    clearPendingUploads();
+    return;
+  }
+
+  const fp = fingerprintSelectedFiles();
+  if (fp && imagesUploadFingerprint.value === fp && uploadedImageIds.value.length) return;
+  if (isUploadingImages.value) return;
+
+  isUploadingImages.value = true;
+  try {
+    const form = new FormData();
+    for (const item of uploadedFiles.value) {
+      const maybeCompressed = await compressImageFile(item.file, {
+        maxWidth: 1920,
+        maxHeight: 1920,
+        quality: 0.82,
+        keepPng: true,
+      });
+      form.append("images[]", maybeCompressed, item.file.name);
+      form.append("labels[]", item.name || item.file.name);
+    }
+
+    logPayloadPreview(form, "Media Upload Payload");
+    const res = await uploadImages(form);
+    console.groupCollapsed("[Media] Upload Response");
+    console.log("Status:", res?.status);
+    console.log("Data:", res?.data);
+    console.groupEnd();
+    const body = res?.data as any;
+    const list = Array.isArray(body?.data?.data)
+      ? body.data.data
+      : Array.isArray(body?.data)
+        ? body.data
+        : [];
+    uploadedImageIds.value = list.map((x: any) => String(x?.id ?? "").trim()).filter(Boolean);
+    imagesUploadFingerprint.value = fp;
+  } catch (error) {
+    console.groupCollapsed("[Media] Upload Error");
+    console.error(error);
+    console.log("Response status:", (error as any)?.response?.status);
+    console.log("Response data:", (error as any)?.response?.data);
+    console.groupEnd();
+    throw error;
+  } finally {
+    isUploadingImages.value = false;
+  }
+}
 const selectedTags = ref<string[]>([]);
 const selectedTagIds = ref<string[]>([]);
 const tagInput = ref("");
@@ -53,6 +149,12 @@ const clientRole = ref("");
 const clientEmail = ref("");
 const clientMobile = ref("+92");
 
+/** Raw rows from GET /clients for the picker; may include a merged row when editing a project whose client is not in the list yet. */
+const existingClientsRaw = ref<Record<string, unknown>[]>([]);
+const clientInputMode = ref<"existing" | "new">("new");
+const selectedExistingClientId = ref("");
+const isLoadingClients = ref(false);
+
 // Step 2: Payment structure
 type PaymentStructure = "single" | "multiple" | "recurring";
 const paymentStructure = ref<PaymentStructure>("single");
@@ -62,7 +164,9 @@ const projectAmountSingle = ref("");
 const currencySingle = ref("PKR");
 const taxHandling = ref<"including" | "exclusive">("including");
 const paymentMethodSingle = ref("PayPak");
-const paymentTiming = ref<"before" | "after" | "specific">("specific");
+/** Matches backend `payment_schedule` for single-payment projects */
+type SinglePaymentSchedule = "before_start" | "after_completion" | "specific_date";
+const paymentTiming = ref<SinglePaymentSchedule>("specific_date");
 const paymentSpecificDate = ref("");
 const financingOptIn = ref(true);
 
@@ -93,6 +197,27 @@ type RecurringDurationUnit = "weeks" | "months" | "quarters";
 const recurringDurationUnit = ref<RecurringDurationUnit>("months");
 const financingOptInRecurring = ref(true);
 const earlyPayoutAgreedRecurring = ref(false);
+
+/** Server-computed recurring options (PATCH/POST project response). */
+type RecurringCadenceKey = "weekly" | "monthly" | "quarterly";
+type RecurringRunApi = { heading: string; run_on: string };
+type RecurringCadencePayload = {
+  recurrence: boolean;
+  weeks?: number;
+  months?: number;
+  quarters?: number;
+  runs: RecurringRunApi[];
+  amount_per_run: number;
+};
+type RecurringSchedulesData = {
+  weekly?: RecurringCadencePayload;
+  monthly?: RecurringCadencePayload;
+  quarterly?: RecurringCadencePayload;
+};
+
+const recurringSchedulesFromApi = ref<RecurringSchedulesData | null>(null);
+const selectedRecurringCadenceKey = ref<RecurringCadenceKey | null>(null);
+const isLoadingRecurringSchedules = ref(false);
 
 /** Steps shown in the top bar only. Agreement is step 6 in the flow but is not listed here. */
 const stepBarSteps = [
@@ -217,7 +342,224 @@ const isCreatingProject = ref(false);
 
 const agreementActiveNav = ref<"scope" | "timeline" | "payment" | "responsibilities">("scope");
 
+function extractClientsArray(raw: unknown): Record<string, unknown>[] {
+  if (!raw) return [];
+  if (Array.isArray(raw)) return raw as Record<string, unknown>[];
+  const r = raw as Record<string, unknown>;
+  if (Array.isArray(r.data)) return r.data as Record<string, unknown>[];
+  const inner = r.data as Record<string, unknown> | undefined;
+  if (inner && Array.isArray(inner.data)) return inner.data as Record<string, unknown>[];
+  return [];
+}
+
+const effectiveClientMode = computed<"existing" | "new">(() =>
+  existingClientsRaw.value.length > 0 ? clientInputMode.value : "new",
+);
+
+function isPocPhoneFilled(raw: string): boolean {
+  const d = String(raw ?? "").replace(/\D/g, "");
+  return d.length >= 7;
+}
+
+const clientStep1Complete = computed(() => {
+  if (effectiveClientMode.value === "existing") {
+    return Boolean(
+      String(createdClientId.value ?? "").trim() && String(selectedExistingClientId.value ?? "").trim(),
+    );
+  }
+  const brandOk = clientOrBrand.value === "brand" ? Boolean(clientName.value.trim()) : true;
+  return (
+    brandOk &&
+    Boolean(clientContactName.value.trim()) &&
+    Boolean(clientEmail.value.trim()) &&
+    isPocPhoneFilled(clientMobile.value)
+  );
+});
+
+function clientSelectLabel(c: unknown): string {
+  const row = c && typeof c === "object" ? (c as Record<string, unknown>) : {};
+  const typeValue = String(row.type ?? "").trim().toLowerCase();
+  const brand = String(row.brand_name ?? "").trim();
+  const ind = String(row.display_name ?? row.name ?? "").trim();
+  if (typeValue === "individual") return ind || brand || "Individual";
+  return brand || ind || "Client";
+}
+
+function applyApiClientToForm(c: Record<string, unknown>) {
+  const clientType = String(c.type ?? "brand").trim().toLowerCase();
+  createdClientId.value = String(c.id ?? c.uuid ?? "").trim();
+  clientOrBrand.value = clientType === "individual" ? "individual" : "brand";
+  clientName.value =
+    clientType === "individual"
+      ? String(c.display_name ?? c.name ?? c.brand_name ?? "").trim()
+      : String(c.brand_name ?? c.display_name ?? c.name ?? "").trim();
+  clientContactName.value = String(c.poc_name ?? "").trim();
+  clientRole.value = String(
+    (c as { pivot?: { role?: string } }).pivot?.role ?? c.role ?? "",
+  ).trim();
+  clientEmail.value = String(c.poc_email ?? c.email ?? "").trim();
+  clientMobile.value = String(c.poc_phone ?? c.phone ?? c.mobile_number ?? "+92").trim() || "+92";
+}
+
+function unwrapClientFromResponse(body: unknown): Record<string, unknown> | null {
+  if (!body || typeof body !== "object") return null;
+  const o = body as Record<string, unknown>;
+  const inner = o.data;
+  if (inner && typeof inner === "object" && !Array.isArray(inner)) {
+    const nested = (inner as Record<string, unknown>).data;
+    if (nested && typeof nested === "object" && !Array.isArray(nested)) {
+      return nested as Record<string, unknown>;
+    }
+    return inner as Record<string, unknown>;
+  }
+  return o;
+}
+
+/** True when the API only returned an id/pivot row without contact fields. */
+function clientRecordLooksIncomplete(c: Record<string, unknown>): boolean {
+  const hasContact =
+    String(c.poc_name ?? "").trim() ||
+    String(c.poc_email ?? c.email ?? "").trim() ||
+    String(c.poc_phone ?? c.phone ?? c.mobile_number ?? "").trim();
+  const hasDisplay =
+    String(c.display_name ?? c.name ?? c.brand_name ?? "").trim();
+  return !hasContact && !hasDisplay;
+}
+
+async function fetchClientByIdIfPossible(clientId: string): Promise<Record<string, unknown> | null> {
+  const id = String(clientId ?? "").trim();
+  if (!id) return null;
+  try {
+    const res = await getClientById(id);
+    const raw = unwrapClientFromResponse(res?.data) ?? (res?.data as Record<string, unknown> | undefined);
+    if (raw && typeof raw === "object" && !Array.isArray(raw)) return raw;
+  } catch (e) {
+    console.error("[NewProject] getClientById failed", e);
+  }
+  return null;
+}
+
+/**
+ * Resolves the project's primary client from GET /projects/:id (embedded or client_id),
+ * optionally fetching GET /clients/:id when the payload is missing contact fields.
+ */
+async function resolvePrimaryClientForProject(p: Record<string, unknown>): Promise<Record<string, unknown> | null> {
+  const list = Array.isArray(p.clients) ? p.clients : [];
+  let embedded: Record<string, unknown> | null = null;
+  if (list.length > 0 && list[0] && typeof list[0] === "object") {
+    embedded = list[0] as Record<string, unknown>;
+  } else if (p.client && typeof p.client === "object") {
+    embedded = p.client as Record<string, unknown>;
+  } else if (p.primary_client && typeof p.primary_client === "object") {
+    embedded = p.primary_client as Record<string, unknown>;
+  }
+
+  const idFromProject =
+    String(p.client_id ?? p.client_uuid ?? "").trim() ||
+    (typeof p.client === "string" || typeof p.client === "number" ? String(p.client) : "").trim();
+
+  let resolved = embedded;
+  if (!resolved && idFromProject) {
+    resolved = await fetchClientByIdIfPossible(idFromProject);
+  } else if (resolved && clientRecordLooksIncomplete(resolved)) {
+    const cid = String(resolved.id ?? resolved.uuid ?? idFromProject ?? "").trim();
+    if (cid) {
+      const full = await fetchClientByIdIfPossible(cid);
+      if (full) resolved = full;
+    }
+  }
+
+  return resolved;
+}
+
+function resetNewClientFields() {
+  createdClientId.value = "";
+  selectedExistingClientId.value = "";
+  clientName.value = "";
+  clientOrBrand.value = "brand";
+  clientContactName.value = "";
+  clientRole.value = "";
+  clientEmail.value = "";
+  clientMobile.value = "+92";
+}
+
+function ensureClientInList(client: Record<string, unknown> | null) {
+  if (!client || typeof client !== "object") return;
+  const id = String(client.id ?? client.uuid ?? "").trim();
+  if (!id) return;
+  const idx = existingClientsRaw.value.findIndex((x) => String(x?.id ?? x?.uuid ?? "").trim() === id);
+  if (idx < 0) {
+    existingClientsRaw.value = [...existingClientsRaw.value, client];
+    return;
+  }
+  const prev = existingClientsRaw.value[idx] as Record<string, unknown>;
+  existingClientsRaw.value = [
+    ...existingClientsRaw.value.slice(0, idx),
+    { ...prev, ...client },
+    ...existingClientsRaw.value.slice(idx + 1),
+  ];
+}
+
+function onExistingClientSelectChange() {
+  const id = String(selectedExistingClientId.value ?? "").trim();
+  if (!id) {
+    createdClientId.value = "";
+    return;
+  }
+  const c = existingClientsRaw.value.find((x) => String(x?.id ?? x?.uuid ?? "").trim() === id);
+  if (c) applyApiClientToForm(c);
+}
+
+function setClientOrBrandType(next: "brand" | "individual") {
+  clientOrBrand.value = next;
+  if (next === "individual") clientName.value = "";
+}
+
+function setClientInputMode(mode: "existing" | "new") {
+  clientInputMode.value = mode;
+  if (mode === "new") {
+    resetNewClientFields();
+  } else {
+    createdClientId.value = "";
+    selectedExistingClientId.value = "";
+    clientName.value = "";
+    clientOrBrand.value = "brand";
+    clientContactName.value = "";
+    clientRole.value = "";
+    clientEmail.value = "";
+    clientMobile.value = "+92";
+  }
+}
+
+function validateStep1RequiredFieldsOrAlert(): boolean {
+  const missing: string[] = [];
+  if (!projectName.value.trim()) missing.push("Project name");
+  if (effectiveClientMode.value === "existing") {
+    if (!String(createdClientId.value ?? "").trim() || !String(selectedExistingClientId.value ?? "").trim()) {
+      missing.push("Client selection");
+    }
+  } else {
+    if (clientOrBrand.value === "brand" && !clientName.value.trim()) missing.push("Client or brand name");
+    if (!clientContactName.value.trim()) missing.push("Name");
+    if (!clientEmail.value.trim()) missing.push("Email");
+    if (!isPocPhoneFilled(clientMobile.value)) missing.push("Mobile Number");
+  }
+  if (!selectedProjectScopeId.value.trim()) missing.push("Project scope");
+
+  if (missing.length === 0) return true;
+
+  currentStep.value = 1;
+  pushAlert({
+    kind: "error",
+    title: "Missing required fields",
+    message: `Please fill ${missing.join(", ")} to continue or save as draft.`,
+  });
+  return false;
+}
+
 const primaryActionDisabled = computed(() => {
+  if (currentStep.value === 1 && !projectName.value.trim()) return true;
+  if (currentStep.value === 1 && !clientStep1Complete.value) return true;
   if (currentStep.value === 1 && !selectedProjectScopeId.value.trim()) return true;
   if (currentStep.value === 1 && isSavingInitialProject.value) return true;
   if (isAgreementStep.value && isCreatingProject.value) return true;
@@ -226,6 +568,12 @@ const primaryActionDisabled = computed(() => {
   if (isFinancingStepRecurring.value && !earlyPayoutAgreedRecurring.value) return true;
   if (currentStep.value === 3 && paymentStructure.value === "single") {
     if (singleAmountNumeric.value <= 0) return true;
+    if (
+      paymentTiming.value === "specific_date" &&
+      !String(paymentSpecificDate.value ?? "").trim()
+    ) {
+      return true;
+    }
   }
   if (currentStep.value === 3 && paymentStructure.value === "multiple") {
     // Require full milestone allocation before moving forward.
@@ -234,7 +582,8 @@ const primaryActionDisabled = computed(() => {
   }
   if (currentStep.value === 3 && paymentStructure.value === "recurring") {
     if (recurringAmountNumeric.value <= 0) return true;
-    if (recurringPeriodCountInt.value < 1) return true;
+    if (isLoadingRecurringSchedules.value) return true;
+    if (recurringScheduleDisplayRows.value.length < 1) return true;
   }
   if (
     isAgreementStep.value &&
@@ -304,6 +653,27 @@ const reviewSectionOpen = reactive({
   payment: true,
 });
 
+/** When true (after toggling the review header pencil), each review card shows an Edit control. */
+const reviewSectionsEditMode = ref(false);
+
+watch(currentStep, (s) => {
+  if (s !== 5) reviewSectionsEditMode.value = false;
+});
+
+function toggleReviewSectionsEditMode() {
+  reviewSectionsEditMode.value = !reviewSectionsEditMode.value;
+}
+
+function goToStepFromReview(step: number, scrollToClientOnStep1?: boolean) {
+  reviewSectionsEditMode.value = false;
+  currentStep.value = step;
+  if (step === 1 && scrollToClientOnStep1) {
+    nextTick(() => {
+      document.getElementById("np-step1-client-details")?.scrollIntoView({ behavior: "smooth", block: "start" });
+    });
+  }
+}
+
 function displayOrDash(value: string) {
   const t = String(value ?? "").trim();
   return t.length ? t : "—";
@@ -338,28 +708,222 @@ function parseIsoDateLocal(iso: string): Date {
   return new Date(y, mo, d);
 }
 
-const recurringSchedulePreview = computed(() => {
-  const n = recurringPeriodCountInt.value;
-  const unit = recurringDurationUnit.value;
-  const per = recurringAmountNumeric.value;
-  if (n < 1 || per <= 0) return [] as { index: number; dueLabel: string; amountLine: string }[];
-  const base = parseIsoDateLocal(startDate.value);
-  const cur = currencyRecurring.value;
-  const amt = per.toLocaleString("en-PK");
-  const out: { index: number; dueLabel: string; amountLine: string }[] = [];
-  for (let i = 0; i < n; i++) {
-    const d = new Date(base.getTime());
-    if (unit === "weeks") d.setDate(d.getDate() + i * 7);
-    else if (unit === "months") d.setMonth(d.getMonth() + i);
-    else d.setMonth(d.getMonth() + i * 3);
-    const dueLabel = d.toLocaleDateString("en-GB", {
+function formatRecurringRunOnLabel(raw: string): string {
+  const s = String(raw ?? "").trim();
+  if (!s) return "—";
+  if (/^\d{4}-\d{2}-\d{2}/.test(s)) {
+    const d = parseIsoDateLocal(s);
+    if (Number.isFinite(d.getTime())) {
+      return d.toLocaleDateString("en-GB", {
+        day: "numeric",
+        month: "long",
+        year: "numeric",
+      });
+    }
+  }
+  const d = new Date(s);
+  if (Number.isFinite(d.getTime())) {
+    return d.toLocaleDateString("en-GB", {
       day: "numeric",
       month: "long",
       year: "numeric",
     });
-    out.push({ index: i + 1, dueLabel, amountLine: `${cur} ${amt}` });
   }
-  return out;
+  return s;
+}
+
+function normalizeRecurringCadencePayload(raw: unknown): RecurringCadencePayload | undefined {
+  if (!raw || typeof raw !== "object") return undefined;
+  const o = raw as Record<string, unknown>;
+  const runsRaw = o.runs;
+  const runs: RecurringRunApi[] = Array.isArray(runsRaw)
+    ? runsRaw.map((r: unknown) => {
+        const row = r && typeof r === "object" ? (r as Record<string, unknown>) : {};
+        return {
+          heading: String(row.heading ?? "").trim() || "Payment",
+          run_on: String(row.run_on ?? "").trim(),
+        };
+      })
+    : [];
+  const apr = o.amount_per_run;
+  const amountPer =
+    typeof apr === "number" ? apr : parseFloat(String(apr ?? "").replace(/,/g, "").trim());
+  const payload: RecurringCadencePayload = {
+    recurrence: Boolean(o.recurrence),
+    weeks: typeof o.weeks === "number" ? o.weeks : undefined,
+    months: typeof o.months === "number" ? o.months : undefined,
+    quarters: typeof o.quarters === "number" ? o.quarters : undefined,
+    runs,
+    amount_per_run: Number.isFinite(amountPer) ? amountPer : 0,
+  };
+  if (!runs.length) return undefined;
+  return payload;
+}
+
+function extractRecurringSchedulesFromProjectResponse(body: unknown): RecurringSchedulesData | null {
+  const tryObject = (o: unknown): RecurringSchedulesData | null => {
+    if (!o || typeof o !== "object" || Array.isArray(o)) return null;
+    const rec = o as Record<string, unknown>;
+    const weekly = normalizeRecurringCadencePayload(rec.weekly);
+    const monthly = normalizeRecurringCadencePayload(rec.monthly);
+    const quarterly = normalizeRecurringCadencePayload(rec.quarterly);
+    if (!weekly && !monthly && !quarterly) return null;
+    return { weekly, monthly, quarterly };
+  };
+
+  if (!body || typeof body !== "object") return null;
+  const root = body as Record<string, unknown>;
+
+  const fromRoot = tryObject(root);
+  if (fromRoot) return fromRoot;
+
+  const layer = root.data;
+  if (layer && typeof layer === "object" && !Array.isArray(layer)) {
+    const L = layer as Record<string, unknown>;
+    const fromLayer = tryObject(L);
+    if (fromLayer) return fromLayer;
+    const inner = L.data;
+    if (inner && typeof inner === "object" && !Array.isArray(inner)) {
+      const fromInner = tryObject(inner);
+      if (fromInner) return fromInner;
+    }
+    const proj = L.project;
+    if (proj && typeof proj === "object" && !Array.isArray(proj)) {
+      const fromProj = tryObject(proj);
+      if (fromProj) return fromProj;
+    }
+  }
+
+  const projectTop = root.project;
+  if (projectTop && typeof projectTop === "object" && !Array.isArray(projectTop)) {
+    const fromProj = tryObject(projectTop);
+    if (fromProj) return fromProj;
+  }
+
+  const meta = root.meta;
+  if (meta && typeof meta === "object" && !Array.isArray(meta)) {
+    const M = meta as Record<string, unknown>;
+    const fromMeta = tryObject(M);
+    if (fromMeta) return fromMeta;
+    const raw = M.recurring_schedules ?? M.recurring_schedule_options;
+    if (typeof raw === "string" && raw.trim()) {
+      try {
+        const parsed = JSON.parse(raw) as unknown;
+        const fromJson = tryObject(parsed);
+        if (fromJson) return fromJson;
+      } catch {
+        /* ignore */
+      }
+    } else {
+      const fromJson = tryObject(raw);
+      if (fromJson) return fromJson;
+    }
+  }
+
+  return null;
+}
+
+function applyCadenceToForm(key: RecurringCadenceKey, payload: RecurringCadencePayload) {
+  const n = Math.max(1, payload.runs.length);
+  if (key === "weekly") {
+    recurringDurationUnit.value = "weeks";
+    recurringDurationCount.value = Math.max(1, payload.weeks ?? n);
+  } else if (key === "monthly") {
+    recurringDurationUnit.value = "months";
+    recurringDurationCount.value = Math.max(1, payload.months ?? n);
+  } else {
+    recurringDurationUnit.value = "quarters";
+    recurringDurationCount.value = Math.max(1, payload.quarters ?? n);
+  }
+}
+
+function applySchedulesAfterFetch(data: RecurringSchedulesData | null) {
+  recurringSchedulesFromApi.value = data;
+  if (!data) {
+    selectedRecurringCadenceKey.value = null;
+    return;
+  }
+  const order: RecurringCadenceKey[] = ["weekly", "monthly", "quarterly"];
+  const available = order.filter((k) => {
+    const p = data[k];
+    return p && p.runs.length > 0;
+  });
+  if (!available.length) {
+    selectedRecurringCadenceKey.value = null;
+    return;
+  }
+  const current = selectedRecurringCadenceKey.value;
+  const next = current && available.includes(current) ? current : available[0];
+  selectedRecurringCadenceKey.value = next;
+  const payload = data[next];
+  if (payload) applyCadenceToForm(next, payload);
+}
+
+function applySchedulesFromProjectResponse(body: unknown) {
+  applySchedulesAfterFetch(extractRecurringSchedulesFromProjectResponse(body));
+}
+
+function selectRecurringCadence(key: RecurringCadenceKey) {
+  const data = recurringSchedulesFromApi.value?.[key];
+  if (!data?.runs?.length) return;
+  selectedRecurringCadenceKey.value = key;
+  applyCadenceToForm(key, data);
+}
+
+/** Backend expects `weekly` | `monthly` | `quarterly` (see `recurrence[frequency]` on PATCH). */
+function recurrenceFrequencyForApi(): string {
+  const key = selectedRecurringCadenceKey.value;
+  if (key === "weekly") return "weekly";
+  if (key === "monthly") return "monthly";
+  if (key === "quarterly") return "quarterly";
+  const u = recurringDurationUnit.value;
+  if (u === "weeks") return "weekly";
+  if (u === "months") return "monthly";
+  return "quarterly";
+}
+
+function appendRecurringProjectExtraFields(form: FormData) {
+  form.append("meta[recurring_duration_count]", String(recurringPeriodCountInt.value));
+  form.append("meta[recurring_duration_unit]", String(recurringDurationUnit.value));
+  form.append("recurrence[frequency]", recurrenceFrequencyForApi());
+  form.append("meta[payment_method]", String(paymentMethodRecurring.value));
+  form.append("meta[early_payout_agreed]", toIntegerFlag(earlyPayoutAgreedRecurring.value));
+}
+
+const recurringCadenceOptions = computed(() => {
+  const data = recurringSchedulesFromApi.value;
+  if (!data) return [] as { key: RecurringCadenceKey; label: string }[];
+  const labels: Record<RecurringCadenceKey, string> = {
+    weekly: "Weekly",
+    monthly: "Monthly",
+    quarterly: "Quarterly",
+  };
+  const order: RecurringCadenceKey[] = ["weekly", "monthly", "quarterly"];
+  return order
+    .filter((k) => {
+      const p = data[k];
+      return p && p.runs.length > 0;
+    })
+    .map((k) => ({ key: k, label: labels[k] }));
+});
+
+const recurringScheduleDisplayRows = computed(() => {
+  const key = selectedRecurringCadenceKey.value;
+  const data = key ? recurringSchedulesFromApi.value?.[key] : null;
+  if (!data?.runs?.length) {
+    return [] as { index: number; heading: string; dueLabel: string; amountLine: string }[];
+  }
+  const cur = currencyRecurring.value;
+  const amt = data.amount_per_run;
+  const amtStr = Number.isFinite(amt)
+    ? amt.toLocaleString("en-PK", { maximumFractionDigits: 2 })
+    : "—";
+  return data.runs.map((run, i) => ({
+    index: i + 1,
+    heading: run.heading || `Payment ${i + 1}`,
+    dueLabel: formatRecurringRunOnLabel(run.run_on),
+    amountLine: `${cur} ${amtStr}`,
+  }));
 });
 
 const reviewRecurringAmountLine = computed(() => {
@@ -415,9 +979,9 @@ const reviewPaymentStructureLabel = computed(() => {
 
 const reviewPaymentTimingLabel = computed(() => {
   const t = paymentTiming.value;
-  if (t === "before") return "Before starting the project";
-  if (t === "after") return "After completing the project";
-  if (t === "specific") {
+  if (t === "before_start") return "Before starting the project";
+  if (t === "after_completion") return "After completing the project";
+  if (t === "specific_date") {
     const d = displayOrDash(paymentSpecificDate.value);
     return d === "—" ? "On a specific date" : `On a specific date (${d})`;
   }
@@ -513,25 +1077,20 @@ const agreementAmountSummary = computed(() => {
   return `Per ${reviewPaymentStructureLabel.value.toLowerCase()} (amounts to be finalized)`;
 });
 
-const projectTypeOptions = [
-  "Select project type",
-  "Brand photography",
-  "Event photography",
-  "Product photography",
-  "Food photography",
-  "Fashion photography",
-  "Others",
+const projectStatusOptions: { value: ProjectStatus; label: string }[] = [
+  { value: "signed", label: "Signed" },
+  { value: "in_progress", label: "In Progress" },
+  { value: "completed", label: "Completed" },
+  { value: "delayed", label: "Delayed" },
+  { value: "in_dispute", label: "In Dispute" },
+  { value: "payment_due", label: "Payment Due" },
+  { value: "draft", label: "Draft" },
+  { value: "discussion", label: "Discussion" },
 ];
-const projectStatusOptions = [
-  "Signed",
-  "In Progress",
-  "Completed",
-  "Delayed",
-  "in Dispute",
-  "Payment Due",
-  "Draft",
-  "Discussion",
-];
+
+const selectedProjectStatusLabel = computed(() =>
+  projectStatusLabelText(projectStatus.value),
+);
 
 const allTags = computed(() => availableTags.value.map((t) => `#${t.name}`));
 
@@ -622,20 +1181,241 @@ function onFileChange(e: Event) {
   for (let i = 0; i < files.length; i++) {
     uploadedFiles.value.push({ name: files[i].name, type: files[i].type, file: files[i] });
   }
+  clearPendingUploads();
   input.value = "";
 }
 
 function removeFile(index: number) {
   uploadedFiles.value = uploadedFiles.value.filter((_, i) => i !== index);
+  clearPendingUploads();
 }
 
 function handleSaveExit() {
+  saveDraftAndExit();
+}
+
+function inferPaymentTypeForApi(): "single" | "milestone" | "recurring" {
+  if (paymentStructure.value === "multiple") return "milestone";
+  return paymentStructure.value;
+}
+
+function currencyForCurrentStructure(): string {
+  return paymentStructure.value === "multiple"
+    ? currencyMultiple.value
+    : paymentStructure.value === "recurring"
+      ? currencyRecurring.value
+      : currencySingle.value;
+}
+
+async function saveDraftAndExit() {
+  if (!validateStep1RequiredFieldsOrAlert()) return;
+  try {
+    await ensureInitialProjectCreated();
+  } catch {
+    return;
+  }
+
+  if (!createdProjectId.value) return;
+
+  // If user added new files while editing an existing draft, upload first
+  // so we can send `image_ids[]` with the project update payload.
+  await ensureUploadedImageIds();
+
+  const form = new FormData();
+  appendCommonProjectPayloadFields(form, {
+    type: inferPaymentTypeForApi(),
+    amount:
+      paymentStructure.value === "multiple"
+        ? normalizedAmount(projectAmountMultiple.value)
+        : paymentStructure.value === "recurring"
+          ? normalizedAmount(projectAmountRecurring.value)
+          : normalizedAmount(projectAmountSingle.value),
+    financingApplied:
+      paymentStructure.value === "multiple"
+        ? financingOptInMultiple.value
+        : paymentStructure.value === "recurring"
+          ? financingOptInRecurring.value
+          : financingOptIn.value,
+    currency: currencyForCurrentStructure(),
+    // Draft-save must not be blocked by payment schedule validations.
+    // Use a safe schedule that doesn't require a date.
+    paymentSchedule: "before_start",
+    paymentScheduleDate: "",
+    gstInclusive:
+      paymentStructure.value === "recurring"
+        ? taxHandlingRecurring.value === "including"
+        : paymentStructure.value === "multiple"
+          ? taxHandlingMultiple.value === "including"
+          : taxHandling.value === "including",
+    statusOverride: "draft",
+  });
+
+  if (paymentStructure.value === "recurring") {
+    appendRecurringProjectExtraFields(form);
+  }
+
+  logPayloadPreview(form, "Project Update Payload (Draft Save)");
+  try {
+    await updateProject(createdProjectId.value, form);
+  } catch (error) {
+    console.error("Draft save failed", error);
+    return;
+  }
+
+  // If the user created milestones on the frontend, persist them for the draft too.
+  // Avoid duplicate creation by respecting the didCreateMilestones flag.
+  try {
+    if (shouldCreateMilestonesNow()) {
+      await createMilestonesSequentially(createdProjectId.value);
+      didCreateMilestones.value = true;
+    }
+  } catch (error) {
+    console.error("Draft milestone save failed", error);
+    // Still allow user to exit after saving the draft project itself.
+  }
+
   emit("close");
 }
 
-function goToReviewEdit() {
-  currentStep.value = 1;
+function mapApiStatusToUi(status: unknown): string {
+  return normalizeProjectStatus(status);
 }
+
+function toIsoDateOnly(value: unknown): string {
+  const raw = String(value ?? "").trim();
+  if (!raw) return "";
+  // If it's already YYYY-MM-DD (or begins with it), keep the date part.
+  const m = /^(\d{4}-\d{2}-\d{2})/.exec(raw);
+  if (m) return m[1];
+  const d = new Date(raw);
+  if (Number.isNaN(d.getTime())) return "";
+  return d.toISOString().slice(0, 10);
+}
+
+async function loadProjectForEdit(projectId: string) {
+  /** Load address book first so hydration is not overwritten by a later GET /clients, and effectiveClientMode is correct. */
+  await loadClients();
+
+  const response = await getProjectById(projectId);
+  const project = unwrapProjectFromBody(response?.data) ?? {};
+  const p: any = project;
+
+  createdProjectId.value = String(p.id ?? p.uuid ?? projectId);
+
+  projectName.value = String(p.title ?? p.name ?? "").trim();
+  scopeDescription.value = String(p.description ?? p.scope ?? p.meta?.notes ?? "").trim();
+  projectStatus.value = mapApiStatusToUi(p.status);
+
+  startDate.value = toIsoDateOnly(p.start_date ?? p.startDate ?? "");
+  endDate.value = toIsoDateOnly(p.end_date ?? p.endDate ?? "");
+  selectedProjectScopeId.value = String(
+    p.project_scope_id ?? p.projectScopeId ?? selectedProjectScopeId.value ?? "",
+  );
+
+  const typeValue = String(p.type ?? "").trim().toLowerCase();
+  paymentStructure.value =
+    typeValue === "milestone" ? "multiple" : typeValue === "recurring" ? "recurring" : "single";
+
+  if (paymentStructure.value === "single") {
+    const scheduleNorm = normalizeSinglePaymentScheduleFromApi(
+      p.payment_schedule ?? p.paymentSchedule,
+    );
+    if (scheduleNorm) paymentTiming.value = scheduleNorm;
+    const schedDate = p.payment_schedule_date ?? p.paymentScheduleDate ?? "";
+    const iso = toIsoDateOnly(schedDate);
+    paymentSpecificDate.value = iso || String(schedDate ?? "").trim();
+  }
+
+  const currency = String(p.currency ?? p.currency_code ?? "PKR");
+  currencySingle.value = currency;
+  currencyMultiple.value = currency;
+  currencyRecurring.value = currency;
+
+  const amountRaw = String(p.amount ?? p.total_amount ?? p.totalAmount ?? "");
+  projectAmountSingle.value = amountRaw;
+  projectAmountMultiple.value = amountRaw;
+  projectAmountRecurring.value = amountRaw;
+
+  existingMedia.value = normalizeExistingMedia(p.images ?? p.media ?? []);
+  clearPendingUploads();
+
+  // Hydrate existing milestones (if any) so the draft edit screen matches server state
+  // and Save & Exit doesn't duplicate milestone creation.
+  const serverMilestones = Array.isArray(p.milestones) ? p.milestones : [];
+  if (serverMilestones.length) {
+    milestones.value = serverMilestones.map((m: any, index: number) => ({
+      id: index + 1,
+      percentage: String(m?.percentage ?? m?.percent ?? "").trim(),
+      date: toIsoDateOnly(m?.due_on ?? m?.dueOn ?? m?.date ?? m?.due_date ?? m?.dueDate ?? ""),
+      amount: String(m?.amount ?? m?.value ?? "").trim(),
+      deliverables: String(m?.deliverables ?? m?.description ?? "").trim(),
+    }));
+    nextMilestoneId.value = milestones.value.length + 1;
+    didCreateMilestones.value = true;
+  } else {
+    didCreateMilestones.value = false;
+  }
+
+  selectedTagIds.value = Array.isArray(p.tags)
+    ? p.tags
+        .map((t: any) => String(t?.id ?? t?.uuid ?? ""))
+        .filter(Boolean)
+    : [];
+  selectedTags.value = Array.isArray(p.tags)
+    ? p.tags.map((t: any) => String(t?.name ?? "")).filter(Boolean)
+    : [];
+
+  const primaryClient = await resolvePrimaryClientForProject(p as Record<string, unknown>);
+  if (primaryClient && typeof primaryClient === "object") {
+    clientInputMode.value = "existing";
+    ensureClientInList(primaryClient);
+    applyApiClientToForm(primaryClient);
+    selectedExistingClientId.value = createdClientId.value;
+  } else {
+    clientInputMode.value = "new";
+    selectedExistingClientId.value = "";
+  }
+
+  if (paymentStructure.value === "recurring") {
+    const meta = (p.meta && typeof p.meta === "object" ? p.meta : {}) as Record<string, unknown>;
+    const countRaw = meta.recurring_duration_count;
+    const unitRaw = meta.recurring_duration_unit;
+    const c = Math.floor(Number(countRaw));
+    if (Number.isFinite(c) && c > 0) recurringDurationCount.value = c;
+    const u = String(unitRaw ?? "").toLowerCase();
+    if (u === "weeks" || u === "week") recurringDurationUnit.value = "weeks";
+    else if (u === "months" || u === "month") recurringDurationUnit.value = "months";
+    else if (u === "quarters" || u === "quarter") recurringDurationUnit.value = "quarters";
+
+    const pid = createdProjectId.value;
+    if (pid && recurringAmountNumeric.value > 0) {
+      try {
+        const ro = await getProjectRecurrenceOptions(pid);
+        applySchedulesFromProjectResponse(ro?.data);
+      } catch (e) {
+        console.error("Failed to load recurrence options", e);
+        const hydrated = extractRecurringSchedulesFromProjectResponse({ data: p });
+        if (hydrated) applySchedulesAfterFetch(hydrated);
+      }
+    } else {
+      const hydrated = extractRecurringSchedulesFromProjectResponse({ data: p });
+      if (hydrated) applySchedulesAfterFetch(hydrated);
+    }
+  }
+}
+
+watch(
+  () => props.projectId,
+  async (nextId) => {
+    if (!nextId) return;
+    try {
+      await loadProjectForEdit(nextId);
+    } catch (e) {
+      console.error("Failed to load project for editing", e);
+    }
+  },
+  { immediate: true },
+);
 
 function scrollAgreementSection(section: "scope" | "timeline" | "payment" | "responsibilities") {
   agreementActiveNav.value = section;
@@ -766,16 +1546,22 @@ function deleteMilestone(milestoneId: number) {
 }
 
 function mapProjectStatusForApi(status: string): string {
-  return String(status ?? "")
-    .trim()
-    .toLowerCase()
-    .replace(/\s+/g, "_");
+  return normalizeProjectStatus(status);
 }
 
-function mapPaymentScheduleForApi(): string {
-  if (paymentTiming.value === "before") return "before_start";
-  if (paymentTiming.value === "after") return "after_completion";
-  return "specific_date";
+function normalizeSinglePaymentScheduleFromApi(raw: unknown): SinglePaymentSchedule | null {
+  const s = String(raw ?? "")
+    .trim()
+    .toLowerCase()
+    .replace(/-/g, "_");
+  if (s === "before_start") return "before_start";
+  if (s === "after_completion") return "after_completion";
+  if (s === "specific_date") return "specific_date";
+  return null;
+}
+
+function mapPaymentScheduleForApi(): SinglePaymentSchedule {
+  return paymentTiming.value;
 }
 
 function toIntegerFlag(value: boolean): string {
@@ -785,6 +1571,14 @@ function toIntegerFlag(value: boolean): string {
 function normalizedAmount(amount: string): string {
   const n = parseFloat(String(amount ?? "").replace(/,/g, "").trim());
   return Number.isFinite(n) ? String(n) : "0";
+}
+
+function effectiveEndDateForApi(): string {
+  const end = String(endDate.value ?? "").trim();
+  if (end) return end;
+  const start = String(startDate.value ?? "").trim();
+  if (start) return start;
+  return todayIsoDate;
 }
 
 function appendCommonProjectPayloadFields(
@@ -797,11 +1591,15 @@ function appendCommonProjectPayloadFields(
     paymentSchedule?: string;
     paymentScheduleDate?: string;
     gstInclusive?: boolean;
+    statusOverride?: string;
   },
 ) {
   form.append("title", projectName.value.trim());
   form.append("description", scopeDescription.value.trim());
-  form.append("status", mapProjectStatusForApi(projectStatus.value));
+  form.append(
+    "status",
+    mapProjectStatusForApi(options.statusOverride ?? projectStatus.value),
+  );
   form.append("type", options.type);
   form.append("amount", options.amount);
   form.append(
@@ -817,12 +1615,15 @@ function appendCommonProjectPayloadFields(
   for (const tagId of selectedTagIds.value) {
     form.append("tag_ids[]", tagId);
   }
-  for (const item of uploadedFiles.value) {
-    form.append("images[]", item.file, item.file.name);
+  // Backend validates `image_ids[]` as "selectable" uploads; re-sending already-attached IDs
+  // during draft PATCH steps can fail validation. So only send image_ids when we have NEW uploads.
+  for (const id of uploadedImageIds.value) {
+    if (id) form.append("image_ids[]", id);
   }
 
   form.append("start_date", startDate.value || "");
-  form.append("end_date", endDate.value || "");
+  // Backend requires a non-null end_date; if user leaves it empty, fall back safely.
+  form.append("end_date", effectiveEndDateForApi());
   form.append("meta[notes]", scopeDescription.value.trim());
 
   form.append("client[is_primary]", "1");
@@ -832,17 +1633,15 @@ function appendCommonProjectPayloadFields(
   form.append("client[role]", clientRole.value.trim() || "Contact");
   form.append("client[type]", clientOrBrand.value === "brand" ? "brand" : "individual");
   form.append("client[status]", "active");
-  form.append("client[display_name]", clientContactName.value.trim() || clientName.value.trim());
+  // form.append("client[display_name]", clientContactName.value.trim() || clientName.value.trim());
   form.append("client[brand_name]", clientName.value.trim());
-  form.append("client[email]", clientEmail.value.trim());
-  form.append("client[phone]", clientMobile.value.trim());
   form.append("client[poc_name]", clientContactName.value.trim());
   form.append("client[poc_email]", clientEmail.value.trim());
   form.append("client[poc_phone]", clientMobile.value.trim());
   form.append("client[meta][notes]", "this is a dummy client note");
 }
 
-function logPayloadPreview(form: FormData) {
+function logPayloadPreview(form: FormData, label = "Project Payload") {
   const payloadPreview = Array.from(form.entries()).map(([key, value]) => {
     if (value instanceof File) {
       return {
@@ -856,7 +1655,7 @@ function logPayloadPreview(form: FormData) {
     return { key, type: "text", value };
   });
 
-  console.groupCollapsed("[Project] Create Payload");
+  console.groupCollapsed(`[${label}]`);
   console.table(payloadPreview);
   console.groupEnd();
 }
@@ -936,9 +1735,13 @@ async function createMilestonesSequentially(projectId: string) {
 
 async function ensureInitialProjectCreated() {
   if (createdProjectId.value || isSavingInitialProject.value) return;
+  if (!validateStep1RequiredFieldsOrAlert()) {
+    throw new Error("Missing required step 1 fields");
+  }
 
   isSavingInitialProject.value = true;
   try {
+    await ensureUploadedImageIds();
     const form = new FormData();
 
     // Step 1 create: send safe defaults for payment fields and update them later.
@@ -956,9 +1759,10 @@ async function ensureInitialProjectCreated() {
       // Use a safe default that does not require a date.
       paymentSchedule: "before_start",
       paymentScheduleDate: "",
+      statusOverride: "draft",
     });
 
-    logPayloadPreview(form);
+    logPayloadPreview(form, "Project Create Payload (Step 1 Draft)");
     const response = await createProject(form);
     const { projectId, clientId } = extractCreatedIds(response?.data);
 
@@ -973,7 +1777,8 @@ async function ensureInitialProjectCreated() {
   }
 }
 
-async function submitSingleProject() {
+async function submitSingleProject(options?: { statusOverride?: string }) {
+  await ensureUploadedImageIds();
   const form = new FormData();
 
   appendCommonProjectPayloadFields(form, {
@@ -983,13 +1788,21 @@ async function submitSingleProject() {
     currency: currencySingle.value,
     paymentSchedule: mapPaymentScheduleForApi(),
     paymentScheduleDate:
-      paymentTiming.value === "specific" && paymentSpecificDate.value?.trim() ? paymentSpecificDate.value.trim() : "",
+      paymentTiming.value === "specific_date" && paymentSpecificDate.value?.trim()
+        ? paymentSpecificDate.value.trim()
+        : "",
+    gstInclusive: taxHandling.value === "including",
+    statusOverride: options?.statusOverride,
   });
 
-  logPayloadPreview(form);
+  logPayloadPreview(
+    form,
+    createdProjectId.value ? "Project Update Payload (Single)" : "Project Create Payload (Single)",
+  );
+  const skipApiToast = options?.statusOverride === "draft";
   const response = createdProjectId.value
-    ? await updateProject(createdProjectId.value, form)
-    : await createProject(form);
+    ? await updateProject(createdProjectId.value, form, { skipAlert: skipApiToast })
+    : await createProject(form, { skipAlert: skipApiToast });
   console.groupCollapsed("[Project] Create Response");
   console.log("Status:", response?.status);
   console.log("Data:", response?.data);
@@ -997,13 +1810,14 @@ async function submitSingleProject() {
 
   const anyData = response?.data as any;
   const serverMsg = anyData?.message ?? anyData?.success_message ?? anyData?.data?.message;
-  if (!serverMsg) {
+  if (!options?.statusOverride && !serverMsg) {
     const title = projectName.value.trim() || "Project";
     pushAlert({ kind: "success", title: "Created", message: `${title} created successfully.` });
   }
 }
 
-async function submitMilestoneProject() {
+async function submitMilestoneProject(options?: { statusOverride?: string }) {
+  await ensureUploadedImageIds();
   const form = new FormData();
 
   appendCommonProjectPayloadFields(form, {
@@ -1014,12 +1828,20 @@ async function submitMilestoneProject() {
     // Milestone payload shared by API has these keys present, even when empty.
     paymentSchedule: "",
     paymentScheduleDate: "",
+    gstInclusive: taxHandlingMultiple.value === "including",
+    statusOverride: options?.statusOverride,
   });
 
-  logPayloadPreview(form);
+  logPayloadPreview(
+    form,
+    createdProjectId.value
+      ? "Project Update Payload (Milestone)"
+      : "Project Create Payload (Milestone)",
+  );
+  const skipApiToast = options?.statusOverride === "draft";
   const response = createdProjectId.value
-    ? await updateProject(createdProjectId.value, form)
-    : await createProject(form);
+    ? await updateProject(createdProjectId.value, form, { skipAlert: skipApiToast })
+    : await createProject(form, { skipAlert: skipApiToast });
   console.groupCollapsed("[Project] Create Response");
   console.log("Status:", response?.status);
   console.log("Data:", response?.data);
@@ -1039,15 +1861,14 @@ async function submitMilestoneProject() {
 
   const anyData = response?.data as any;
   const serverMsg = anyData?.message ?? anyData?.success_message ?? anyData?.data?.message;
-  if (!serverMsg) {
+  if (!options?.statusOverride && !serverMsg) {
     const title = projectName.value.trim() || "Project";
     pushAlert({ kind: "success", title: "Created", message: `${title} created successfully.` });
   }
 }
 
-async function submitRecurringProject() {
+function buildRecurringPatchFormData(options?: { statusOverride?: string }): FormData {
   const form = new FormData();
-
   appendCommonProjectPayloadFields(form, {
     type: "recurring",
     amount: normalizedAmount(projectAmountRecurring.value),
@@ -1056,28 +1877,159 @@ async function submitRecurringProject() {
     paymentSchedule: "",
     paymentScheduleDate: "",
     gstInclusive: taxHandlingRecurring.value === "including",
+    statusOverride: options?.statusOverride,
   });
+  appendRecurringProjectExtraFields(form);
+  return form;
+}
 
-  // Keep these under meta[] to avoid breaking the core API shape.
-  form.append("meta[recurring_duration_count]", String(recurringPeriodCountInt.value));
-  form.append("meta[recurring_duration_unit]", String(recurringDurationUnit.value));
-  form.append("meta[payment_method]", String(paymentMethodRecurring.value));
-  form.append("meta[early_payout_agreed]", toIntegerFlag(earlyPayoutAgreedRecurring.value));
+let recurringScheduleRefreshTimer: ReturnType<typeof setTimeout> | null = null;
 
-  logPayloadPreview(form);
+function scheduleRecurringSchedulesRefresh() {
+  if (currentStep.value !== 3 || paymentStructure.value !== "recurring") return;
+  if (recurringAmountNumeric.value <= 0) {
+    recurringSchedulesFromApi.value = null;
+    selectedRecurringCadenceKey.value = null;
+    return;
+  }
+  if (recurringScheduleRefreshTimer) clearTimeout(recurringScheduleRefreshTimer);
+  recurringScheduleRefreshTimer = setTimeout(() => {
+    recurringScheduleRefreshTimer = null;
+    void refreshRecurringSchedulesFromApi();
+  }, 400);
+}
+
+async function refreshRecurringSchedulesFromApi() {
+  if (paymentStructure.value !== "recurring") return;
+  if (recurringAmountNumeric.value <= 0) {
+    recurringSchedulesFromApi.value = null;
+    selectedRecurringCadenceKey.value = null;
+    return;
+  }
+
+  if (!createdProjectId.value) {
+    if (
+      currentStep.value === 3 &&
+      projectName.value.trim() &&
+      clientStep1Complete.value &&
+      selectedProjectScopeId.value.trim()
+    ) {
+      try {
+        await ensureInitialProjectCreated();
+      } catch {
+        return;
+      }
+    }
+  }
+  if (!createdProjectId.value) return;
+
+  isLoadingRecurringSchedules.value = true;
+  try {
+    await ensureUploadedImageIds();
+    const form = buildRecurringPatchFormData({ statusOverride: "draft" });
+    await updateProject(createdProjectId.value, form, { skipAlert: true });
+    const recurrenceRes = await getProjectRecurrenceOptions(createdProjectId.value);
+    applySchedulesFromProjectResponse(recurrenceRes?.data);
+  } catch (e) {
+    console.error("Recurring schedule refresh failed", e);
+  } finally {
+    isLoadingRecurringSchedules.value = false;
+  }
+}
+
+async function submitRecurringProject(options?: { statusOverride?: string }) {
+  await ensureUploadedImageIds();
+  const form = buildRecurringPatchFormData(options);
+
+  logPayloadPreview(
+    form,
+    createdProjectId.value
+      ? "Project Update Payload (Recurring)"
+      : "Project Create Payload (Recurring)",
+  );
+  const skipApiToast = options?.statusOverride === "draft";
   const response = createdProjectId.value
-    ? await updateProject(createdProjectId.value, form)
-    : await createProject(form);
+    ? await updateProject(createdProjectId.value, form, { skipAlert: skipApiToast })
+    : await createProject(form, { skipAlert: skipApiToast });
   console.groupCollapsed("[Project] Create Response");
   console.log("Status:", response?.status);
   console.log("Data:", response?.data);
   console.groupEnd();
 
+  const { projectId: createdFromBody } = extractCreatedIds(response?.data);
+  if (createdFromBody && !createdProjectId.value) {
+    createdProjectId.value = createdFromBody;
+  }
+  const pidForRecurrence = createdProjectId.value;
+  if (pidForRecurrence) {
+    try {
+      const ro = await getProjectRecurrenceOptions(pidForRecurrence);
+      applySchedulesFromProjectResponse(ro?.data);
+    } catch {
+      applySchedulesFromProjectResponse(response?.data);
+    }
+  } else {
+    applySchedulesFromProjectResponse(response?.data);
+  }
+
   const anyData = response?.data as any;
   const serverMsg = anyData?.message ?? anyData?.success_message ?? anyData?.data?.message;
-  if (!serverMsg) {
+  if (!options?.statusOverride && !serverMsg) {
     const title = projectName.value.trim() || "Project";
     pushAlert({ kind: "success", title: "Created", message: `${title} created successfully.` });
+  }
+}
+
+watch(
+  [
+    currentStep,
+    paymentStructure,
+    createdProjectId,
+    projectAmountRecurring,
+    currencyRecurring,
+    taxHandlingRecurring,
+    startDate,
+  ],
+  () => {
+    scheduleRecurringSchedulesRefresh();
+  },
+  { flush: "post", immediate: true },
+);
+
+/** After payment structure (step 2): persist type + safe defaults so the project stays draft until final submit. */
+async function persistDraftPaymentStructureOnly() {
+  if (!createdProjectId.value) return;
+  await ensureUploadedImageIds();
+  const form = new FormData();
+  appendCommonProjectPayloadFields(form, {
+    type: inferPaymentTypeForApi(),
+    amount: "0",
+    financingApplied: false,
+    currency: currencyForCurrentStructure(),
+    paymentSchedule: "before_start",
+    paymentScheduleDate: "",
+    statusOverride: "draft",
+  });
+  logPayloadPreview(form, "Project Update Payload (Payment Structure Draft)");
+  await updateProject(createdProjectId.value, form);
+}
+
+/** While advancing through payment structure, details, and early payout, PATCH with the user's chosen status forced to draft. */
+async function persistWizardStepAsDraft() {
+  if (!createdProjectId.value) return;
+  const step = currentStep.value;
+  if (step === 2) {
+    await persistDraftPaymentStructureOnly();
+    return;
+  }
+  if (step === 3 || step === 4) {
+    if (paymentStructure.value === "single") {
+      await submitSingleProject({ statusOverride: "draft" });
+    } else if (paymentStructure.value === "multiple") {
+      await submitMilestoneProject({ statusOverride: "draft" });
+    } else {
+      await submitRecurringProject({ statusOverride: "draft" });
+    }
   }
 }
 
@@ -1126,9 +2078,30 @@ async function loadProjectScopes() {
   }
 }
 
+async function loadClients() {
+  isLoadingClients.value = true;
+  try {
+    const response = await getClients();
+    const list = extractClientsArray(response?.data);
+    existingClientsRaw.value = list;
+    if (list.length > 0 && !props.projectId) {
+      clientInputMode.value = "existing";
+    }
+  } catch (error) {
+    console.error("Failed to load clients", error);
+    existingClientsRaw.value = [];
+  } finally {
+    isLoadingClients.value = false;
+  }
+}
+
 onMounted(() => {
   loadTags();
   loadProjectScopes();
+  /** Draft/edit loads clients inside `loadProjectForEdit` to avoid races with hydration. */
+  if (!props.projectId) {
+    loadClients();
+  }
 });
 
 async function handleContinue() {
@@ -1143,8 +2116,7 @@ async function handleContinue() {
       console.groupEnd();
       return;
     }
-  }
-  if (currentStep.value === 6) {
+  } else if (currentStep.value === 6) {
     isCreatingProject.value = true;
     try {
       if (paymentStructure.value === "single") {
@@ -1169,6 +2141,21 @@ async function handleContinue() {
     }
     emit("complete");
     return;
+  } else if (currentStep.value === 2 || currentStep.value === 3 || currentStep.value === 4) {
+    try {
+      await persistWizardStepAsDraft();
+    } catch (error: any) {
+      console.groupCollapsed("[Project] Draft persist Error");
+      console.error("Status:", error?.response?.status ?? "unknown");
+      console.error("Data:", error?.response?.data ?? error);
+      console.groupEnd();
+      pushAlert({
+        kind: "error",
+        title: "Could not save",
+        message: "We could not save your progress. Check your connection and try again.",
+      });
+      return;
+    }
   }
   if (currentStep.value === 3 && paymentStructure.value === "single" && !financingOptIn.value) {
     currentStep.value = 5;
@@ -1218,43 +2205,76 @@ async function handleContinue() {
             <Label class="new-project-label">Project Name</Label>
             <Input v-model="projectName" placeholder="Project Name" class="new-project-input" />
           </div>
-          <div class="new-project-field">
-            <Label class="new-project-label">Type of project</Label>
-            <select
-              v-model="projectType"
-              class="new-project-select"
-              aria-label="Project type"
-            >
-              <option v-for="opt in projectTypeOptions" :key="opt" :value="opt === 'Select project type' ? '' : opt" :disabled="opt === 'Select project type'">
-                {{ opt }}
-              </option>
-            </select>
-          </div>
-          <div class="new-project-field">
+          <div v-if="existingClientsRaw.length > 0" class="new-project-field">
             <Label class="new-project-label">Client</Label>
-            <Input v-model="clientName" placeholder="Client or Brand Name" class="new-project-input" />
-          </div>
-          <div class="new-project-field">
-            <Label class="new-project-label">Is this a client or brand?</Label>
-            <div class="new-project-toggle">
+            <div class="new-project-toggle" role="group" aria-label="Choose client source">
               <button
                 type="button"
                 class="new-project-toggle-btn"
-                :class="{ 'new-project-toggle-btn--active': clientOrBrand === 'brand' }"
-                @click="clientOrBrand = 'brand'"
+                :class="{ 'new-project-toggle-btn--active': clientInputMode === 'existing' }"
+                :disabled="isLoadingClients"
+                @click="setClientInputMode('existing')"
               >
-                Brand
+                Existing client
               </button>
               <button
                 type="button"
                 class="new-project-toggle-btn"
-                :class="{ 'new-project-toggle-btn--active': clientOrBrand === 'individual' }"
-                @click="clientOrBrand = 'individual'"
+                :class="{ 'new-project-toggle-btn--active': clientInputMode === 'new' }"
+                :disabled="isLoadingClients"
+                @click="setClientInputMode('new')"
               >
-                Individual Client
+                Add new client
               </button>
             </div>
           </div>
+
+          <div v-if="effectiveClientMode === 'existing'" class="new-project-field">
+            <Label class="new-project-label">Select client</Label>
+            <select
+              v-model="selectedExistingClientId"
+              class="new-project-select"
+              aria-label="Select existing client"
+              @change="onExistingClientSelectChange"
+            >
+              <option value="" disabled>{{ isLoadingClients ? "Loading clients…" : "Select a client" }}</option>
+              <option
+                v-for="(c, idx) in existingClientsRaw"
+                :key="String(c?.id ?? c?.uuid ?? idx)"
+                :value="String(c?.id ?? c?.uuid ?? '')"
+              >
+                {{ clientSelectLabel(c) }}
+              </option>
+            </select>
+          </div>
+
+          <template v-else>
+            <div v-if="clientOrBrand === 'brand'" class="new-project-field">
+              <Label class="new-project-label">Client</Label>
+              <Input v-model="clientName" placeholder="Client or Brand Name" class="new-project-input" />
+            </div>
+            <div class="new-project-field">
+              <Label class="new-project-label">Is this a client or brand?</Label>
+              <div class="new-project-toggle">
+                <button
+                  type="button"
+                  class="new-project-toggle-btn"
+                  :class="{ 'new-project-toggle-btn--active': clientOrBrand === 'brand' }"
+                  @click="setClientOrBrandType('brand')"
+                >
+                  Brand
+                </button>
+                <button
+                  type="button"
+                  class="new-project-toggle-btn"
+                  :class="{ 'new-project-toggle-btn--active': clientOrBrand === 'individual' }"
+                  @click="setClientOrBrandType('individual')"
+                >
+                  Individual Client
+                </button>
+              </div>
+            </div>
+          </template>
           <div class="new-project-row new-project-row--three">
             <div class="new-project-field">
               <Label class="new-project-label">Project status</Label>
@@ -1263,8 +2283,8 @@ async function handleContinue() {
                 class="new-project-select"
                 aria-label="Project status"
               >
-                <option v-for="opt in projectStatusOptions" :key="opt" :value="opt">
-                  {{ opt }}
+                <option v-for="opt in projectStatusOptions" :key="opt.value" :value="opt.value">
+                  {{ opt.label }}
                 </option>
               </select>
             </div>
@@ -1307,6 +2327,21 @@ async function handleContinue() {
 
         <!-- File upload -->
         <div class="new-project-upload-area">
+          <div v-if="existingMedia.length" class="new-project-existing-media">
+            <div class="new-project-existing-media-title">Saved media</div>
+            <div class="project-details-media">
+              <a
+                v-for="item in existingMedia"
+                :key="item.key"
+                class="project-details-media-thumb"
+                :href="item.url"
+                target="_blank"
+                rel="noreferrer"
+              >
+                <img class="project-details-media-img" :src="item.url" :alt="item.path" loading="lazy" />
+              </a>
+            </div>
+          </div>
           <label class="new-project-upload-label">
             <input
               type="file"
@@ -1410,8 +2445,8 @@ async function handleContinue() {
         </div>
       </section>
 
-      <!-- Client Details -->
-      <section class="new-project-section">
+      <!-- Client Details: prefilled when an existing client is selected -->
+      <section id="np-step1-client-details" class="new-project-section">
         <h3 class="new-project-section-title">Client Details</h3>
         <div class="new-project-fields new-project-fields--grid">
           <div class="new-project-field">
@@ -1548,28 +2583,28 @@ async function handleContinue() {
       <section class="new-project-section">
         <h3 class="new-project-section-title">When do you want to be paid?</h3>
         <div class="new-project-radio-stack">
-          <label class="new-project-radio-card" :class="{ 'new-project-radio-card--checked': paymentTiming === 'before' }">
-            <input v-model="paymentTiming" type="radio" value="before" class="new-project-radio-input" />
+          <label class="new-project-radio-card" :class="{ 'new-project-radio-card--checked': paymentTiming === 'before_start' }">
+            <input v-model="paymentTiming" type="radio" value="before_start" class="new-project-radio-input" />
             <span class="new-project-radio-body">
               <span class="new-project-radio-title">Before Starting the project</span>
               <span class="new-project-radio-hint">Get paid upfront before you begin any work.</span>
             </span>
           </label>
-          <label class="new-project-radio-card" :class="{ 'new-project-radio-card--checked': paymentTiming === 'after' }">
-            <input v-model="paymentTiming" type="radio" value="after" class="new-project-radio-input" />
+          <label class="new-project-radio-card" :class="{ 'new-project-radio-card--checked': paymentTiming === 'after_completion' }">
+            <input v-model="paymentTiming" type="radio" value="after_completion" class="new-project-radio-input" />
             <span class="new-project-radio-body">
               <span class="new-project-radio-title">After completing the project</span>
               <span class="new-project-radio-hint">Get paid when work is approved and delivered.</span>
             </span>
           </label>
-          <label class="new-project-radio-card" :class="{ 'new-project-radio-card--checked': paymentTiming === 'specific' }">
-            <input v-model="paymentTiming" type="radio" value="specific" class="new-project-radio-input" />
+          <label class="new-project-radio-card" :class="{ 'new-project-radio-card--checked': paymentTiming === 'specific_date' }">
+            <input v-model="paymentTiming" type="radio" value="specific_date" class="new-project-radio-input" />
             <span class="new-project-radio-body">
               <span class="new-project-radio-title">On a specific date</span>
               <span class="new-project-radio-hint">Choose a custom date for payment.</span>
             </span>
           </label>
-          <div v-if="paymentTiming === 'specific'" class="new-project-date-field">
+          <div v-if="paymentTiming === 'specific_date'" class="new-project-date-field">
             <DateSelect v-model="paymentSpecificDate" placeholder="DD/MM/YYYY" display-format="dd/mm/yyyy" />
           </div>
         </div>
@@ -1721,6 +2756,7 @@ async function handleContinue() {
           v-else
           type="button"
           class="new-project-milestone-add"
+          :disabled="multipleAmountNumeric <= 0 || milestoneRemainingNumeric <= 0"
           @click="addMilestone"
         >
           Add another milestone
@@ -1752,7 +2788,12 @@ async function handleContinue() {
         <div class="new-project-field">
           <Label class="new-project-label">Project Amount</Label>
           <div class="new-project-amount-row">
-            <Input v-model="projectAmountRecurring" class="new-project-input new-project-amount-input" placeholder="0" />
+            <Input
+              v-model="projectAmountRecurring"
+              class="new-project-input new-project-amount-input"
+              placeholder="0"
+              @update:model-value="scheduleRecurringSchedulesRefresh"
+            />
             <select v-model="currencyRecurring" class="new-project-select new-project-currency-select" aria-label="Currency">
               <option v-for="c in currencyOptions" :key="c" :value="c">{{ c }}</option>
             </select>
@@ -1792,62 +2833,55 @@ async function handleContinue() {
       <section class="new-project-section">
         <h3 class="new-project-section-title">Payment schedules</h3>
         <div class="new-project-field">
-          <Label class="new-project-label">Project Duration</Label>
-          <div class="new-project-duration-row">
-            <Input
-              v-model.number="recurringDurationCount"
-              type="number"
-              min="1"
-              step="1"
-              class="new-project-input new-project-duration-input"
-              placeholder="0"
-            />
-            <div class="new-project-duration-units" role="group" aria-label="Duration unit">
-              <button
-                type="button"
-                class="new-project-duration-unit"
-                :class="{ 'new-project-duration-unit--active': recurringDurationUnit === 'weeks' }"
-                @click="recurringDurationUnit = 'weeks'"
-              >
-                Weeks
-              </button>
-              <button
-                type="button"
-                class="new-project-duration-unit"
-                :class="{ 'new-project-duration-unit--active': recurringDurationUnit === 'months' }"
-                @click="recurringDurationUnit = 'months'"
-              >
-                Months
-              </button>
-              <button
-                type="button"
-                class="new-project-duration-unit"
-                :class="{ 'new-project-duration-unit--active': recurringDurationUnit === 'quarters' }"
-                @click="recurringDurationUnit = 'quarters'"
-              >
-                Quarters
-              </button>
-            </div>
+          <Label class="new-project-label">Payment frequency</Label>
+          <p class="new-project-duration-hint new-project-duration-hint--spaced">
+            Choose how often your client pays. Schedules are calculated by Create and cannot be edited here.
+          </p>
+          <div
+            v-if="recurringCadenceOptions.length"
+            class="new-project-duration-units new-project-duration-units--wrap"
+            role="group"
+            aria-label="Payment frequency"
+          >
+            <button
+              v-for="opt in recurringCadenceOptions"
+              :key="opt.key"
+              type="button"
+              class="new-project-duration-unit"
+              :disabled="isLoadingRecurringSchedules"
+              :class="{ 'new-project-duration-unit--active': selectedRecurringCadenceKey === opt.key }"
+              @click="selectRecurringCadence(opt.key)"
+            >
+              {{ opt.label }}
+            </button>
           </div>
-          <p class="new-project-duration-hint">Due dates use your project start date; each payment is spaced by one {{ recurringDurationUnit.slice(0, -1) }}.</p>
+          <p v-else-if="isLoadingRecurringSchedules" class="new-project-schedule-empty">Loading payment schedules…</p>
+          <p
+            v-else-if="recurringAmountNumeric > 0"
+            class="new-project-schedule-empty"
+          >
+            No schedule options were returned. Try adjusting the project amount or dates.
+          </p>
+          <p v-else class="new-project-schedule-empty">Enter a project amount to load payment schedules.</p>
         </div>
 
         <div class="new-project-field new-project-field--full">
-          <Label class="new-project-label">Payment Schedule Preview</Label>
-          <div v-if="recurringSchedulePreview.length" class="new-project-schedule-preview">
+          <Label class="new-project-label">Payment schedule</Label>
+          <div v-if="recurringScheduleDisplayRows.length" class="new-project-schedule-preview">
             <div
-              v-for="row in recurringSchedulePreview"
+              v-for="row in recurringScheduleDisplayRows"
               :key="row.index"
               class="new-project-schedule-row"
             >
               <div class="new-project-schedule-main">
-                <span class="new-project-schedule-title">#{{ row.index }} Payment</span>
+                <span class="new-project-schedule-title">{{ row.heading }}</span>
                 <span class="new-project-schedule-due">Due on {{ row.dueLabel }}</span>
               </div>
               <span class="new-project-schedule-amount">{{ row.amountLine }}</span>
             </div>
           </div>
-          <p v-else class="new-project-schedule-empty">Enter an amount and duration to see scheduled payments.</p>
+          <p v-else-if="isLoadingRecurringSchedules" class="new-project-schedule-empty">Loading…</p>
+          <p v-else class="new-project-schedule-empty">Schedules appear here after you enter a project amount.</p>
         </div>
       </section>
 
@@ -1999,8 +3033,10 @@ async function handleContinue() {
         <button
           type="button"
           class="new-project-review-edit"
-          aria-label="Edit from project details"
-          @click="goToReviewEdit"
+          :class="{ 'new-project-review-edit--active': reviewSectionsEditMode }"
+          :aria-pressed="reviewSectionsEditMode"
+          :aria-label="reviewSectionsEditMode ? 'Hide section edit buttons' : 'Show section edit buttons'"
+          @click="toggleReviewSectionsEditMode"
         >
           <span class="new-project-review-edit-icon" aria-hidden="true">
             <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 20h9"/><path d="M16.5 3.5a2.12 2.12 0 0 1 3 3L7 19l-4 1 1-4Z"/></svg>
@@ -2009,27 +3045,36 @@ async function handleContinue() {
       </header>
 
       <section class="new-project-review-section">
-        <button
-          type="button"
-          class="new-project-review-section-head"
-          :aria-expanded="reviewSectionOpen.project"
-          @click="reviewSectionOpen.project = !reviewSectionOpen.project"
-        >
-          <span class="new-project-review-section-title">Project Details</span>
-          <span
-            class="new-project-review-chevron"
-            :class="{ 'new-project-review-chevron--open': reviewSectionOpen.project }"
-            aria-hidden="true"
-          >▲</span>
-        </button>
+        <div class="new-project-review-section-head-row">
+          <button
+            type="button"
+            class="new-project-review-section-head"
+            :aria-expanded="reviewSectionOpen.project"
+            @click="reviewSectionOpen.project = !reviewSectionOpen.project"
+          >
+            <span class="new-project-review-section-title">Project Details</span>
+            <span
+              class="new-project-review-chevron"
+              :class="{ 'new-project-review-chevron--open': reviewSectionOpen.project }"
+              aria-hidden="true"
+            >▲</span>
+          </button>
+          <button
+            v-if="reviewSectionsEditMode"
+            type="button"
+            class="new-project-review-section-edit"
+            aria-label="Edit project details"
+            @click="goToStepFromReview(1)"
+          >
+            <span class="new-project-review-edit-icon" aria-hidden="true">
+              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 20h9"/><path d="M16.5 3.5a2.12 2.12 0 0 1 3 3L7 19l-4 1 1-4Z"/></svg>
+            </span>
+          </button>
+        </div>
         <div v-show="reviewSectionOpen.project" class="new-project-review-body">
           <div class="new-project-review-kv">
             <span class="new-project-review-k">Name</span>
             <span class="new-project-review-v">{{ displayOrDash(projectName) }}</span>
-          </div>
-          <div class="new-project-review-kv">
-            <span class="new-project-review-k">Type</span>
-            <span class="new-project-review-v">{{ displayOrDash(projectType) }}</span>
           </div>
           <div class="new-project-review-kv">
             <span class="new-project-review-k">Client</span>
@@ -2049,7 +3094,7 @@ async function handleContinue() {
           </div>
           <div class="new-project-review-kv">
             <span class="new-project-review-k">Status</span>
-            <span class="new-project-review-v">{{ displayOrDash(projectStatus) }}</span>
+            <span class="new-project-review-v">{{ displayOrDash(selectedProjectStatusLabel) }}</span>
           </div>
           <div class="new-project-review-kv">
             <span class="new-project-review-k">Project scope</span>
@@ -2067,19 +3112,32 @@ async function handleContinue() {
       </section>
 
       <section class="new-project-review-section">
-        <button
-          type="button"
-          class="new-project-review-section-head"
-          :aria-expanded="reviewSectionOpen.client"
-          @click="reviewSectionOpen.client = !reviewSectionOpen.client"
-        >
-          <span class="new-project-review-section-title">Client Details</span>
-          <span
-            class="new-project-review-chevron"
-            :class="{ 'new-project-review-chevron--open': reviewSectionOpen.client }"
-            aria-hidden="true"
-          >▲</span>
-        </button>
+        <div class="new-project-review-section-head-row">
+          <button
+            type="button"
+            class="new-project-review-section-head"
+            :aria-expanded="reviewSectionOpen.client"
+            @click="reviewSectionOpen.client = !reviewSectionOpen.client"
+          >
+            <span class="new-project-review-section-title">Client Details</span>
+            <span
+              class="new-project-review-chevron"
+              :class="{ 'new-project-review-chevron--open': reviewSectionOpen.client }"
+              aria-hidden="true"
+            >▲</span>
+          </button>
+          <button
+            v-if="reviewSectionsEditMode"
+            type="button"
+            class="new-project-review-section-edit"
+            aria-label="Edit client details"
+            @click="goToStepFromReview(1, true)"
+          >
+            <span class="new-project-review-edit-icon" aria-hidden="true">
+              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 20h9"/><path d="M16.5 3.5a2.12 2.12 0 0 1 3 3L7 19l-4 1 1-4Z"/></svg>
+            </span>
+          </button>
+        </div>
         <div v-show="reviewSectionOpen.client" class="new-project-review-body">
           <div class="new-project-review-kv">
             <span class="new-project-review-k">Name</span>
@@ -2105,19 +3163,32 @@ async function handleContinue() {
       </section>
 
       <section class="new-project-review-section">
-        <button
-          type="button"
-          class="new-project-review-section-head"
-          :aria-expanded="reviewSectionOpen.payment"
-          @click="reviewSectionOpen.payment = !reviewSectionOpen.payment"
-        >
-          <span class="new-project-review-section-title">Payment Details</span>
-          <span
-            class="new-project-review-chevron"
-            :class="{ 'new-project-review-chevron--open': reviewSectionOpen.payment }"
-            aria-hidden="true"
-          >▲</span>
-        </button>
+        <div class="new-project-review-section-head-row">
+          <button
+            type="button"
+            class="new-project-review-section-head"
+            :aria-expanded="reviewSectionOpen.payment"
+            @click="reviewSectionOpen.payment = !reviewSectionOpen.payment"
+          >
+            <span class="new-project-review-section-title">Payment Details</span>
+            <span
+              class="new-project-review-chevron"
+              :class="{ 'new-project-review-chevron--open': reviewSectionOpen.payment }"
+              aria-hidden="true"
+            >▲</span>
+          </button>
+          <button
+            v-if="reviewSectionsEditMode"
+            type="button"
+            class="new-project-review-section-edit"
+            aria-label="Edit payment details"
+            @click="goToStepFromReview(3)"
+          >
+            <span class="new-project-review-edit-icon" aria-hidden="true">
+              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 20h9"/><path d="M16.5 3.5a2.12 2.12 0 0 1 3 3L7 19l-4 1 1-4Z"/></svg>
+            </span>
+          </button>
+        </div>
         <div v-show="reviewSectionOpen.payment" class="new-project-review-body">
           <template v-if="paymentStructure === 'single'">
             <div class="new-project-review-kv">
@@ -2215,14 +3286,27 @@ async function handleContinue() {
       </section>
 
       <section v-if="paymentStructure === 'multiple'" class="new-project-review-section">
-        <button
-          type="button"
-          class="new-project-review-section-head"
-          aria-expanded="true"
-        >
-          <span class="new-project-review-section-title">Payment Milestone</span>
-          <span class="new-project-review-chevron new-project-review-chevron--open" aria-hidden="true">▲</span>
-        </button>
+        <div class="new-project-review-section-head-row">
+          <button
+            type="button"
+            class="new-project-review-section-head"
+            aria-expanded="true"
+          >
+            <span class="new-project-review-section-title">Payment Milestone</span>
+            <span class="new-project-review-chevron new-project-review-chevron--open" aria-hidden="true">▲</span>
+          </button>
+          <button
+            v-if="reviewSectionsEditMode"
+            type="button"
+            class="new-project-review-section-edit"
+            aria-label="Edit payment milestones"
+            @click="goToStepFromReview(3)"
+          >
+            <span class="new-project-review-edit-icon" aria-hidden="true">
+              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 20h9"/><path d="M16.5 3.5a2.12 2.12 0 0 1 3 3L7 19l-4 1 1-4Z"/></svg>
+            </span>
+          </button>
+        </div>
         <div class="new-project-review-body">
           <template v-if="milestones.length">
             <div
@@ -2252,23 +3336,36 @@ async function handleContinue() {
       </section>
 
       <section v-if="paymentStructure === 'recurring'" class="new-project-review-section">
-        <button
-          type="button"
-          class="new-project-review-section-head"
-          aria-expanded="true"
-        >
-          <span class="new-project-review-section-title">Payment schedule</span>
-          <span class="new-project-review-chevron new-project-review-chevron--open" aria-hidden="true">▲</span>
-        </button>
+        <div class="new-project-review-section-head-row">
+          <button
+            type="button"
+            class="new-project-review-section-head"
+            aria-expanded="true"
+          >
+            <span class="new-project-review-section-title">Payment schedule</span>
+            <span class="new-project-review-chevron new-project-review-chevron--open" aria-hidden="true">▲</span>
+          </button>
+          <button
+            v-if="reviewSectionsEditMode"
+            type="button"
+            class="new-project-review-section-edit"
+            aria-label="Edit payment schedule"
+            @click="goToStepFromReview(3)"
+          >
+            <span class="new-project-review-edit-icon" aria-hidden="true">
+              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 20h9"/><path d="M16.5 3.5a2.12 2.12 0 0 1 3 3L7 19l-4 1 1-4Z"/></svg>
+            </span>
+          </button>
+        </div>
         <div class="new-project-review-body">
-          <template v-if="recurringSchedulePreview.length">
+          <template v-if="recurringScheduleDisplayRows.length">
             <div
-              v-for="row in recurringSchedulePreview"
+              v-for="row in recurringScheduleDisplayRows"
               :key="row.index"
               class="new-project-review-milestone-item"
             >
               <div class="new-project-review-kv">
-                <span class="new-project-review-k">#{{ row.index }} Payment</span>
+                <span class="new-project-review-k">{{ row.heading }}</span>
                 <span class="new-project-review-v">{{ row.amountLine }}</span>
               </div>
               <div class="new-project-review-kv">
@@ -2280,7 +3377,7 @@ async function handleContinue() {
           <template v-else>
             <div class="new-project-review-kv new-project-review-kv--block">
               <span class="new-project-review-k">Schedule</span>
-              <span class="new-project-review-v new-project-review-v--muted">Add amount and duration to preview schedule.</span>
+              <span class="new-project-review-v new-project-review-v--muted">Enter a project amount on the payment step to load schedules.</span>
             </div>
           </template>
         </div>
@@ -2288,21 +3385,60 @@ async function handleContinue() {
 
       <section v-if="showFinancingSummaryRow" class="new-project-review-financing-bar">
         <span class="new-project-review-financing-k">Financing</span>
-        <span class="new-project-review-financing-v">
-          You will receive: {{ currencySingle }} {{ earlyPayoutYouReceivePkr }}
-        </span>
+        <div class="new-project-review-financing-trail">
+          <span class="new-project-review-financing-v">
+            You will receive: {{ currencySingle }} {{ earlyPayoutYouReceivePkr }}
+          </span>
+          <button
+            v-if="reviewSectionsEditMode"
+            type="button"
+            class="new-project-review-section-edit"
+            aria-label="Edit financing"
+            @click="goToStepFromReview(4)"
+          >
+            <span class="new-project-review-edit-icon" aria-hidden="true">
+              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 20h9"/><path d="M16.5 3.5a2.12 2.12 0 0 1 3 3L7 19l-4 1 1-4Z"/></svg>
+            </span>
+          </button>
+        </div>
       </section>
       <section v-else-if="showFinancingSummaryRowMultiple" class="new-project-review-financing-bar">
         <span class="new-project-review-financing-k">Financing</span>
-        <span class="new-project-review-financing-v">
-          You will receive: {{ reviewMultipleFinancingLine }}
-        </span>
+        <div class="new-project-review-financing-trail">
+          <span class="new-project-review-financing-v">
+            You will receive: {{ reviewMultipleFinancingLine }}
+          </span>
+          <button
+            v-if="reviewSectionsEditMode"
+            type="button"
+            class="new-project-review-section-edit"
+            aria-label="Edit financing"
+            @click="goToStepFromReview(4)"
+          >
+            <span class="new-project-review-edit-icon" aria-hidden="true">
+              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 20h9"/><path d="M16.5 3.5a2.12 2.12 0 0 1 3 3L7 19l-4 1 1-4Z"/></svg>
+            </span>
+          </button>
+        </div>
       </section>
       <section v-else-if="showFinancingSummaryRowRecurring" class="new-project-review-financing-bar">
         <span class="new-project-review-financing-k">Financing</span>
-        <span class="new-project-review-financing-v">
-          You will receive: {{ currencyRecurring }} {{ earlyPayoutYouReceivePkrRecurring }}
-        </span>
+        <div class="new-project-review-financing-trail">
+          <span class="new-project-review-financing-v">
+            You will receive: {{ currencyRecurring }} {{ earlyPayoutYouReceivePkrRecurring }}
+          </span>
+          <button
+            v-if="reviewSectionsEditMode"
+            type="button"
+            class="new-project-review-section-edit"
+            aria-label="Edit financing"
+            @click="goToStepFromReview(4)"
+          >
+            <span class="new-project-review-edit-icon" aria-hidden="true">
+              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 20h9"/><path d="M16.5 3.5a2.12 2.12 0 0 1 3 3L7 19l-4 1 1-4Z"/></svg>
+            </span>
+          </button>
+        </div>
       </section>
     </div>
 
@@ -2716,6 +3852,41 @@ async function handleContinue() {
 /* Upload */
 .new-project-upload-area {
   margin-top: 20px;
+}
+
+.new-project-existing-media {
+  margin-bottom: 14px;
+}
+
+.new-project-existing-media-title {
+  font-size: 0.875rem;
+  font-weight: 700;
+  color: #0f172a;
+  margin-bottom: 8px;
+}
+
+/* Match the Project Details page media styles */
+.project-details-media {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+
+.project-details-media-thumb {
+  display: block;
+  width: 96px;
+  height: 96px;
+  border: 1px solid #e2e8f0;
+  border-radius: 10px;
+  overflow: hidden;
+  background: #f8fafc;
+}
+
+.project-details-media-img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
 }
 
 .new-project-upload-input {
@@ -3246,6 +4417,15 @@ async function handleContinue() {
   background: #f8fafc;
 }
 
+.new-project-milestone-add:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.new-project-milestone-add:disabled:hover {
+  background: #ffffff;
+}
+
 @media (max-width: 900px) {
   .new-project-milestone-summary {
     grid-template-columns: 1fr;
@@ -3441,6 +4621,21 @@ async function handleContinue() {
   line-height: 1.45;
 }
 
+.new-project-duration-hint--spaced {
+  margin: 0 0 10px;
+}
+
+.new-project-duration-units--wrap {
+  flex-wrap: wrap;
+  gap: 8px;
+  padding: 4px;
+}
+
+.new-project-duration-unit:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
 .new-project-schedule-preview {
   border: 1px solid #e2e8f0;
   border-radius: 10px;
@@ -3623,6 +4818,12 @@ async function handleContinue() {
   border-color: #cbd5e1;
 }
 
+.new-project-review-edit--active {
+  background: #eff6ff;
+  border-color: #93c5fd;
+  color: #1d4ed8;
+}
+
 .new-project-review-edit-icon {
   display: flex;
   align-items: center;
@@ -3635,6 +4836,39 @@ async function handleContinue() {
   border-radius: 12px;
   box-shadow: 0 1px 3px rgba(0, 0, 0, 0.04);
   overflow: hidden;
+}
+
+.new-project-review-section-head-row {
+  display: flex;
+  align-items: stretch;
+  gap: 0;
+}
+
+.new-project-review-section-head-row .new-project-review-section-head {
+  flex: 1;
+  min-width: 0;
+}
+
+.new-project-review-section-edit {
+  flex-shrink: 0;
+  align-self: center;
+  margin-right: 14px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 40px;
+  height: 40px;
+  border-radius: 50%;
+  border: 1px solid #e2e8f0;
+  background: #fff;
+  color: #0f172a;
+  cursor: pointer;
+  transition: background 0.15s, border-color 0.15s;
+}
+
+.new-project-review-section-edit:hover {
+  background: #f8fafc;
+  border-color: #cbd5e1;
 }
 
 .new-project-review-section-head {
@@ -3732,6 +4966,15 @@ async function handleContinue() {
   border-radius: 12px;
   box-shadow: 0 1px 3px rgba(0, 0, 0, 0.04);
   font-size: 0.875rem;
+}
+
+.new-project-review-financing-trail {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  flex-wrap: wrap;
+  gap: 12px;
+  text-align: right;
 }
 
 .new-project-review-financing-k {

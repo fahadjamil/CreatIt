@@ -1,6 +1,7 @@
 import { createApp } from 'vue';
 import AppLayout from '@/layouts/AppLayout.vue';
 import router from '@/router';
+import 'sweetalert2/dist/sweetalert2.min.css';
 import '@/css/app.css';
 import { initializeTheme } from '@/composables/useAppearance';
 const app = createApp(AppLayout);

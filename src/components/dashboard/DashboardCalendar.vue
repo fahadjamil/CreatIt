@@ -1,5 +1,15 @@
 <script setup lang="ts">
-import { computed, ref } from "vue";
+import { computed, ref, watch } from "vue";
+import {
+  getCalendar,
+  type CalendarInvoiceRow,
+  type CalendarPayload,
+  type CalendarProjectRow,
+} from "@/lib/api";
+import { useAlerts } from "@/composables/useAlerts";
+import { projectStatusLabel } from "@/lib/projectStatus";
+
+const { pushAlert } = useAlerts();
 
 type CalendarCell = {
   key: string;
@@ -13,11 +23,57 @@ const today = new Date();
 const viewMonthDate = ref(new Date(today.getFullYear(), today.getMonth(), 1));
 const selectedDate = ref(new Date(today.getFullYear(), today.getMonth(), today.getDate()));
 
+const calendarPayload = ref<CalendarPayload | null>(null);
+const loading = ref(false);
+const sideTab = ref<"invoices" | "projects">("invoices");
+
+function formatDateYMD(d: Date): string {
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, "0");
+  const day = String(d.getDate()).padStart(2, "0");
+  return `${y}-${m}-${day}`;
+}
+
+function monthRange(monthStart: Date): { from_date: string; to_date: string } {
+  const y = monthStart.getFullYear();
+  const m = monthStart.getMonth();
+  const from = new Date(y, m, 1);
+  const to = new Date(y, m + 1, 0);
+  return { from_date: formatDateYMD(from), to_date: formatDateYMD(to) };
+}
+
+async function fetchCalendar() {
+  loading.value = true;
+  try {
+    const { from_date, to_date } = monthRange(viewMonthDate.value);
+    const res = await getCalendar({ from_date, to_date });
+    const body = res.data as { data?: CalendarPayload };
+    calendarPayload.value = body.data ?? (res.data as unknown as CalendarPayload) ?? null;
+  } catch {
+    calendarPayload.value = null;
+    pushAlert({
+      kind: "error",
+      title: "Calendar unavailable",
+      message: "We could not load this month. Check your connection and try again.",
+    });
+  } finally {
+    loading.value = false;
+  }
+}
+
+watch(
+  viewMonthDate,
+  () => {
+    void fetchCalendar();
+  },
+  { immediate: true },
+);
+
 const monthLabel = computed(() =>
   viewMonthDate.value.toLocaleDateString("en-GB", {
     month: "short",
     year: "numeric",
-  })
+  }),
 );
 
 const selectedDateLabel = computed(() =>
@@ -25,8 +81,14 @@ const selectedDateLabel = computed(() =>
     day: "numeric",
     month: "short",
     year: "numeric",
-  })
+  }),
 );
+
+const summaryLine = computed(() => {
+  const p = calendarPayload.value;
+  if (!p) return "";
+  return `${p.project_count} project${p.project_count === 1 ? "" : "s"} · ${p.invoice_count} invoice${p.invoice_count === 1 ? "" : "s"} · ${p.holiday_count} holiday${p.holiday_count === 1 ? "" : "s"}`;
+});
 
 const calendarCells = computed<CalendarCell[]>(() => {
   const year = viewMonthDate.value.getFullYear();
@@ -41,7 +103,7 @@ const calendarCells = computed<CalendarCell[]>(() => {
     const day = daysInPrevMonth - startWeekDay + i + 1;
     const date = new Date(year, month - 1, day);
     cells.push({
-      key: `prev-${date.toISOString()}`,
+      key: `prev-${formatDateYMD(date)}`,
       day,
       date,
       inCurrentMonth: false,
@@ -51,7 +113,7 @@ const calendarCells = computed<CalendarCell[]>(() => {
   for (let day = 1; day <= daysInMonth; day += 1) {
     const date = new Date(year, month, day);
     cells.push({
-      key: `curr-${date.toISOString()}`,
+      key: `curr-${formatDateYMD(date)}`,
       day,
       date,
       inCurrentMonth: true,
@@ -62,7 +124,7 @@ const calendarCells = computed<CalendarCell[]>(() => {
     const day = cells.length - (startWeekDay + daysInMonth) + 1;
     const date = new Date(year, month + 1, day);
     cells.push({
-      key: `next-${date.toISOString()}`,
+      key: `next-${formatDateYMD(date)}`,
       day,
       date,
       inCurrentMonth: false,
@@ -72,7 +134,160 @@ const calendarCells = computed<CalendarCell[]>(() => {
   return cells;
 });
 
-const invoiceCards = Array.from({ length: 3 });
+/** YYYY-MM-DD for calendar dots; prefers due date, then issued. */
+function rawToYMD(raw: unknown): string | null {
+  if (raw == null || raw === "") return null;
+  if (typeof raw === "number" && Number.isFinite(raw)) {
+    const d = new Date(raw > 1e12 ? raw : raw * 1000);
+    if (!Number.isNaN(d.getTime())) return formatDateYMD(d);
+  }
+  const s = String(raw).trim();
+  if (!s) return null;
+  if (/^\d{4}-\d{2}-\d{2}/.test(s)) return s.slice(0, 10);
+  const d = new Date(s);
+  if (!Number.isNaN(d.getTime())) return formatDateYMD(d);
+  return null;
+}
+
+function pickInvoiceIssuedRaw(inv: CalendarInvoiceRow): unknown {
+  return (
+    inv.issued_at ??
+    inv.issuedAt ??
+    inv.issued_on ??
+    inv.issue_date ??
+    inv.invoice_date ??
+    inv.date_issued ??
+    inv.created_at ??
+    inv.createdAt ??
+    inv.date
+  );
+}
+
+function pickInvoiceDueRaw(inv: CalendarInvoiceRow): unknown {
+  return inv.due_date ?? inv.due_on ?? inv.dueDate ?? inv.due_at ?? inv.dueAt;
+}
+
+function pickInvoicePaidRaw(inv: CalendarInvoiceRow): unknown {
+  const meta =
+    inv.meta && typeof inv.meta === "object" && !Array.isArray(inv.meta)
+      ? (inv.meta as Record<string, unknown>)
+      : null;
+  return (
+    inv.paid_date ??
+    meta?.paid_date ??
+    meta?.paid_at ??
+    inv.paid_at ??
+    inv.paidAt ??
+    inv.payment_date ??
+    inv.paid_on ??
+    inv.settled_at ??
+    inv.settledAt
+  );
+}
+
+function invoiceIsPaid(inv: CalendarInvoiceRow): boolean {
+  const s = String(inv.status ?? inv.state ?? inv.invoice_status ?? "")
+    .trim()
+    .toLowerCase()
+    .replace(/[\s-]+/g, "_");
+  return s === "paid" || s === "settled";
+}
+
+/** Calendar dot / day association: paid invoices use paid date when present; else due, then issued. */
+function invoicePrimaryDate(inv: CalendarInvoiceRow): string | null {
+  if (invoiceIsPaid(inv)) {
+    const paidYmd = rawToYMD(pickInvoicePaidRaw(inv));
+    if (paidYmd) return paidYmd;
+  }
+  return rawToYMD(pickInvoiceDueRaw(inv)) ?? rawToYMD(pickInvoiceIssuedRaw(inv));
+}
+
+function invoiceRowKey(inv: CalendarInvoiceRow, index: number): string {
+  const id = inv.id ?? inv.uuid;
+  return id != null ? String(id) : `invoice-${index}`;
+}
+
+function invoiceTitle(inv: CalendarInvoiceRow): string {
+  return String(inv.project_name ?? inv.title ?? inv.invoice_title ?? "Invoice");
+}
+
+function invoiceClient(inv: CalendarInvoiceRow): string {
+  return String(inv.client_display_name ?? inv.client_name ?? inv.customer_name ?? "");
+}
+
+function invoiceNumberLine(inv: CalendarInvoiceRow): string {
+  const n = inv.invoice_no ?? inv.invoice_number ?? inv.number ?? inv.code;
+  return n ? String(n) : "";
+}
+
+function parseMoneyish(v: unknown): number | null {
+  if (v == null || v === "") return null;
+  if (typeof v === "number" && Number.isFinite(v)) return v;
+  const n = Number(String(v).replace(/,/g, "").trim());
+  return Number.isFinite(n) ? n : null;
+}
+
+/** Matches project-details / typical API: amount_total, strings with commas, etc. */
+function invoiceAmountLine(inv: CalendarInvoiceRow): string {
+  const keys = [
+    "amount_total",
+    "total_amount",
+    "grand_total",
+    "total",
+    "amount",
+    "subtotal",
+    "amount_subtotal",
+    "invoice_amount",
+    "balance",
+  ] as const;
+  for (const k of keys) {
+    const n = parseMoneyish(inv[k]);
+    if (n != null) return n.toLocaleString("en-PK");
+  }
+  return "—";
+}
+
+function invoiceStatusLine(inv: CalendarInvoiceRow): string {
+  return String(inv.status ?? inv.state ?? inv.invoice_status ?? "").trim() || "—";
+}
+
+function formatShortDate(raw: unknown): string {
+  if (raw == null || raw === "") return "—";
+  if (typeof raw === "number" && Number.isFinite(raw)) {
+    const ms = raw > 1e12 ? raw : raw * 1000;
+    const d = new Date(ms);
+    if (!Number.isNaN(d.getTime())) {
+      return d.toLocaleDateString("en-GB", { day: "2-digit", month: "2-digit", year: "2-digit" });
+    }
+  }
+  const s = String(raw).trim();
+  if (!s) return "—";
+  const d = new Date(/^\d{4}-\d{2}-\d{2}/.test(s) ? s.slice(0, 10) : s);
+  if (!Number.isNaN(d.getTime())) {
+    return d.toLocaleDateString("en-GB", { day: "2-digit", month: "2-digit", year: "2-digit" });
+  }
+  return "—";
+}
+
+function hasHoliday(cell: CalendarCell): boolean {
+  if (!cell.inCurrentMonth) return false;
+  const key = formatDateYMD(cell.date);
+  return calendarPayload.value?.holidays?.some((h) => h.date.slice(0, 10) === key) ?? false;
+}
+
+function hasProjectOrInvoiceEvent(cell: CalendarCell): boolean {
+  if (!cell.inCurrentMonth) return false;
+  const key = formatDateYMD(cell.date);
+  const p = calendarPayload.value;
+  const proj = p?.projects?.some((pr) => pr.end_date?.slice(0, 10) === key) ?? false;
+  const inv =
+    p?.invoices?.some((row) => invoicePrimaryDate(row as CalendarInvoiceRow) === key) ?? false;
+  return proj || inv;
+}
+
+function hasEvents(cell: CalendarCell): boolean {
+  return hasHoliday(cell) || hasProjectOrInvoiceEvent(cell);
+}
 
 function isSameDate(a: Date, b: Date) {
   return (
@@ -82,10 +297,6 @@ function isSameDate(a: Date, b: Date) {
 
 function isSelected(cell: CalendarCell) {
   return isSameDate(cell.date, selectedDate.value);
-}
-
-function hasEvents(cell: CalendarCell) {
-  return cell.inCurrentMonth && [11, 20, 30].includes(cell.day);
 }
 
 function goToToday() {
@@ -112,6 +323,28 @@ function selectDate(cell: CalendarCell) {
     viewMonthDate.value = new Date(cell.date.getFullYear(), cell.date.getMonth(), 1);
   }
 }
+
+function formatProjectEnd(p: CalendarProjectRow): string {
+  if (!p.end_date) return "—";
+  return formatShortDate(p.end_date);
+}
+
+const invoicesList = computed<CalendarInvoiceRow[]>(
+  () => (calendarPayload.value?.invoices ?? []) as CalendarInvoiceRow[],
+);
+const projectsList = computed(() => calendarPayload.value?.projects ?? []);
+
+const selectedDateYmd = computed(() => formatDateYMD(selectedDate.value));
+
+const invoicesForSelectedDate = computed(() => {
+  const key = selectedDateYmd.value;
+  return invoicesList.value.filter((inv) => invoicePrimaryDate(inv) === key);
+});
+
+const projectsForSelectedDate = computed(() => {
+  const key = selectedDateYmd.value;
+  return projectsList.value.filter((p) => String(p.end_date ?? "").slice(0, 10) === key);
+});
 </script>
 
 <template>
@@ -119,16 +352,35 @@ function selectDate(cell: CalendarCell) {
     <div class="calendar-layout">
       <article class="calendar-panel">
         <h2 class="calendar-title">Calendar</h2>
+        <p v-if="summaryLine" class="calendar-summary">{{ summaryLine }}</p>
         <div class="calendar-card">
           <div class="calendar-card-head">
-            <strong>{{ selectedDateLabel }}</strong>
+            <div class="calendar-card-head-date">
+              <strong>{{ selectedDateLabel }}</strong>
+              <span class="calendar-card-head-hint">Select a day to see invoices and projects for that date</span>
+            </div>
             <div class="calendar-actions">
               <span class="calendar-month">{{ monthLabel }}</span>
+              <span v-if="loading" class="calendar-loading">Loading…</span>
               <button type="button" class="calendar-chip calendar-chip--today" @click="goToToday">Today</button>
-              <button type="button" class="calendar-icon-btn" aria-label="Previous" @click="goToPreviousMonth">
+              <button
+                type="button"
+                class="calendar-icon-btn"
+                aria-label="Previous"
+                :disabled="loading"
+                @click="goToPreviousMonth"
+              >
                 ‹
               </button>
-              <button type="button" class="calendar-icon-btn" aria-label="Next" @click="goToNextMonth">›</button>
+              <button
+                type="button"
+                class="calendar-icon-btn"
+                aria-label="Next"
+                :disabled="loading"
+                @click="goToNextMonth"
+              >
+                ›
+              </button>
             </div>
           </div>
           <div class="calendar-grid">
@@ -137,19 +389,23 @@ function selectDate(cell: CalendarCell) {
             <div v-for="cell in calendarCells" :key="cell.key" class="calendar-day">
               <button
                 type="button"
-                class="calendar-day-num"
+                class="calendar-day-hit"
                 :class="{
-                  'calendar-day-num--selected': isSelected(cell),
-                  'calendar-day-num--faded': !cell.inCurrentMonth,
+                  'calendar-day-hit--selected': isSelected(cell),
+                  'calendar-day-hit--faded': !cell.inCurrentMonth,
                 }"
                 @click="selectDate(cell)"
               >
-                {{ cell.day }}
+                <span class="calendar-day-num">{{ cell.day }}</span>
+                <span v-if="hasEvents(cell)" class="calendar-dot-row" aria-hidden="true">
+                  <span v-if="hasHoliday(cell)" class="calendar-dot calendar-dot--holiday"></span>
+                  <span
+                    v-if="hasProjectOrInvoiceEvent(cell)"
+                    class="calendar-dot"
+                    :class="{ 'calendar-dot--muted': hasHoliday(cell) }"
+                  ></span>
+                </span>
               </button>
-              <div v-if="hasEvents(cell)" class="calendar-dot-row">
-                <span class="calendar-dot"></span>
-                <span class="calendar-dot calendar-dot--muted"></span>
-              </div>
             </div>
           </div>
         </div>
@@ -157,37 +413,81 @@ function selectDate(cell: CalendarCell) {
 
       <aside class="calendar-side-panel">
         <div class="calendar-segmented">
-          <button type="button" class="calendar-segmented-item calendar-segmented-item--active">Invoice</button>
-          <button type="button" class="calendar-segmented-item">Projects</button>
+          <button
+            type="button"
+            class="calendar-segmented-item"
+            :class="{ 'calendar-segmented-item--active': sideTab === 'invoices' }"
+            @click="sideTab = 'invoices'"
+          >
+            Invoices ({{ calendarPayload?.invoice_count ?? 0 }})
+          </button>
+          <button
+            type="button"
+            class="calendar-segmented-item"
+            :class="{ 'calendar-segmented-item--active': sideTab === 'projects' }"
+            @click="sideTab = 'projects'"
+          >
+            Projects ({{ calendarPayload?.project_count ?? 0 }})
+          </button>
         </div>
 
-        <article v-for="(_, idx) in invoiceCards" :key="idx" class="invoice-card">
-          <div class="invoice-card-head">
-            <div>
-              <h3>Project Name</h3>
-              <p>Client Name</p>
-              <p>Invoice Number</p>
+        <p class="calendar-side-date-line">Showing: <strong>{{ selectedDateLabel }}</strong></p>
+
+        <template v-if="sideTab === 'invoices'">
+          <p v-if="!loading && invoicesList.length === 0" class="calendar-empty">No invoices in this month.</p>
+          <p v-else-if="!loading && invoicesForSelectedDate.length === 0" class="calendar-empty">
+            No invoices on this date. Choose another day or use month arrows.
+          </p>
+          <article v-for="(inv, idx) in invoicesForSelectedDate" :key="invoiceRowKey(inv, idx)" class="invoice-card">
+            <div class="invoice-card-head">
+              <div>
+                <h3>{{ invoiceTitle(inv) }}</h3>
+                <p v-if="invoiceClient(inv)">{{ invoiceClient(inv) }}</p>
+                <p v-if="invoiceNumberLine(inv)">{{ invoiceNumberLine(inv) }}</p>
+              </div>
+              <div class="invoice-card-badge-wrap">
+                <span class="invoice-status">{{ invoiceStatusLine(inv) }}</span>
+              </div>
             </div>
-            <div class="invoice-card-badge-wrap">
-              <span class="invoice-status">In Review</span>
-              <button type="button" class="invoice-menu" aria-label="More">⋮</button>
+            <div class="invoice-card-meta">
+              <div>
+                <span>Amount (PKR)</span>
+                <strong>{{ invoiceAmountLine(inv) }}</strong>
+              </div>
+              <div>
+                <span>Date issued</span>
+                <strong>{{ formatShortDate(pickInvoiceIssuedRaw(inv)) }}</strong>
+              </div>
+              <div>
+                <span>Date due</span>
+                <strong>{{ formatShortDate(pickInvoiceDueRaw(inv)) }}</strong>
+              </div>
+              <div v-if="invoiceIsPaid(inv)">
+                <span>Date paid</span>
+                <strong>{{ formatShortDate(pickInvoicePaidRaw(inv)) }}</strong>
+              </div>
             </div>
-          </div>
-          <div class="invoice-card-meta">
-            <div>
-              <span>Amount (PKR)</span>
-              <strong>250,000</strong>
+          </article>
+        </template>
+
+        <template v-else>
+          <p v-if="!loading && projectsList.length === 0" class="calendar-empty">No projects ending in this month.</p>
+          <p v-else-if="!loading && projectsForSelectedDate.length === 0" class="calendar-empty">
+            No projects ending on this date.
+          </p>
+          <article v-for="p in projectsForSelectedDate" :key="p.id" class="project-card">
+            <div class="invoice-card-head">
+              <div>
+                <h3>{{ p.project_name }}</h3>
+                <p>{{ p.client_display_name }}</p>
+                <p class="project-card-end">End date {{ formatProjectEnd(p) }}</p>
+              </div>
+              <div class="invoice-card-badge-wrap">
+                <span class="invoice-status">{{ projectStatusLabel(p.status) }}</span>
+              </div>
             </div>
-            <div>
-              <span>Date Issued</span>
-              <strong>25-07-25</strong>
-            </div>
-            <div>
-              <span>Date Due</span>
-              <strong>28-07-25</strong>
-            </div>
-          </div>
-        </article>
+          </article>
+        </template>
       </aside>
     </div>
   </section>
@@ -211,6 +511,12 @@ function selectDate(cell: CalendarCell) {
   color: #131c2c;
 }
 
+.calendar-summary {
+  margin: 0 0 12px;
+  font-size: 0.88rem;
+  color: #6b7280;
+}
+
 .calendar-card {
   border: 1px solid #e6e8ee;
   border-radius: 16px;
@@ -232,10 +538,37 @@ function selectDate(cell: CalendarCell) {
   color: #111827;
 }
 
+.calendar-card-head-date {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.calendar-card-head-hint {
+  font-size: 0.72rem;
+  font-weight: 400;
+  color: #9aa0ac;
+  line-height: 1.3;
+}
+
+.calendar-side-date-line {
+  margin: 0;
+  font-size: 0.82rem;
+  color: #6b7280;
+}
+
+.calendar-side-date-line strong {
+  font-size: inherit;
+  color: #111827;
+}
+
 .calendar-actions {
   display: inline-flex;
   align-items: center;
   gap: 8px;
+  flex-wrap: wrap;
+  justify-content: flex-end;
 }
 
 .calendar-month {
@@ -243,6 +576,11 @@ function selectDate(cell: CalendarCell) {
   color: #6b7280;
   min-width: 78px;
   text-align: center;
+}
+
+.calendar-loading {
+  font-size: 0.78rem;
+  color: #9aa0ac;
 }
 
 .calendar-chip {
@@ -270,6 +608,11 @@ function selectDate(cell: CalendarCell) {
   cursor: pointer;
 }
 
+.calendar-icon-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
 .calendar-grid {
   display: grid;
   grid-template-columns: repeat(7, minmax(0, 1fr));
@@ -286,10 +629,33 @@ function selectDate(cell: CalendarCell) {
 
 .calendar-day {
   min-height: 56px;
-  display: grid;
-  justify-items: center;
-  align-content: start;
+  display: flex;
+  justify-content: center;
+  align-items: flex-start;
+}
+
+.calendar-day-hit {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
   gap: 4px;
+  width: 100%;
+  max-width: 52px;
+  margin: 0;
+  padding: 2px 2px 4px;
+  border: none;
+  border-radius: 12px;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  cursor: pointer;
+  touch-action: manipulation;
+  -webkit-tap-highlight-color: transparent;
+}
+
+.calendar-day-hit:focus-visible {
+  outline: 2px solid #0f234a;
+  outline-offset: 2px;
 }
 
 .calendar-day-num {
@@ -300,16 +666,13 @@ function selectDate(cell: CalendarCell) {
   place-items: center;
   color: #2d3648;
   font-size: 0.95rem;
-  border: none;
-  background: transparent;
-  cursor: pointer;
 }
 
-.calendar-day-num--faded {
+.calendar-day-hit--faded .calendar-day-num {
   color: #a9afba;
 }
 
-.calendar-day-num--selected {
+.calendar-day-hit--selected .calendar-day-num {
   background: #0f234a;
   color: #ffffff;
   font-weight: 600;
@@ -318,6 +681,9 @@ function selectDate(cell: CalendarCell) {
 .calendar-dot-row {
   display: inline-flex;
   gap: 4px;
+  min-height: 6px;
+  align-items: center;
+  justify-content: center;
 }
 
 .calendar-dot {
@@ -331,16 +697,27 @@ function selectDate(cell: CalendarCell) {
   background: #d1d5df;
 }
 
+.calendar-dot--holiday {
+  background: #7c3aed;
+}
+
 .calendar-side-panel {
   display: flex;
   flex-direction: column;
   gap: 10px;
 }
 
+.calendar-empty {
+  margin: 8px 0;
+  font-size: 0.9rem;
+  color: #6b7280;
+}
+
 .calendar-segmented {
   display: inline-flex;
   width: fit-content;
   gap: 8px;
+  flex-wrap: wrap;
 }
 
 .calendar-segmented-item {
@@ -350,6 +727,7 @@ function selectDate(cell: CalendarCell) {
   border-radius: 999px;
   padding: 8px 16px;
   font-size: 0.85rem;
+  cursor: pointer;
 }
 
 .calendar-segmented-item--active {
@@ -363,6 +741,18 @@ function selectDate(cell: CalendarCell) {
   border-radius: 12px;
   background: #ffffff;
   padding: 14px 16px;
+}
+
+.project-card {
+  border: 1px solid #e8ebf1;
+  border-radius: 12px;
+  background: #ffffff;
+  padding: 14px 16px;
+}
+
+.project-card-end {
+  font-size: 0.74rem;
+  color: #5d6780;
 }
 
 .invoice-card-head {
@@ -401,14 +791,6 @@ function selectDate(cell: CalendarCell) {
   font-size: 0.75rem;
   color: #1f2a3d;
   background: #fbfcff;
-}
-
-.invoice-menu {
-  border: none;
-  background: transparent;
-  color: #6f7889;
-  font-size: 1.1rem;
-  line-height: 1;
 }
 
 .invoice-card-meta {
