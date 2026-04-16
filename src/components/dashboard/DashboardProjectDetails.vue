@@ -460,6 +460,30 @@ const selectedMilestoneDetailRow = computed(() =>
 type MilestoneClientStatusKey = "in_review" | "approved" | "rejected";
 const milestoneClientStatusOverrideById = ref<Record<string, MilestoneClientStatusKey | undefined>>({});
 
+const milestoneClientStatusOptions: {
+  key: MilestoneClientStatusKey;
+  label: string;
+  variant: "review" | "approved" | "rejected";
+}[] = [
+  { key: "in_review", label: "In review", variant: "review" },
+  { key: "approved", label: "Approved", variant: "approved" },
+  { key: "rejected", label: "Rejected", variant: "rejected" },
+];
+
+const milestoneClientStatusSelectedKey = computed<MilestoneClientStatusKey>(() => {
+  const row = selectedMilestoneDetailRow.value;
+  if (!row) return "in_review";
+
+  const override = milestoneClientStatusOverrideById.value[row.id];
+  if (override) return override;
+
+  if (row.statusBadgeVariant === "completed") return "approved";
+  const st = String(row.statusBadgeText ?? "").toLowerCase();
+  if (st.includes("approved")) return "approved";
+  if (st.includes("reject")) return "rejected";
+  return "in_review";
+});
+
 const milestoneDetailClientStep = computed(() => {
   const row = selectedMilestoneDetailRow.value;
   if (!row) return { text: "In review", variant: "review" as const };
@@ -3182,15 +3206,19 @@ watch(
                         </button>
                       </DropdownMenuTrigger>
                       <DropdownMenuContent align="start" class="milestone-status-menu">
-                        <div class="milestone-status-menu-title">Milestone Status</div>
-                        <DropdownMenuItem class="milestone-status-menu-item" @select="setMilestoneClientStatus('in_review')">
-                          <span class="milestone-status-pill milestone-status-pill--review">In review</span>
-                        </DropdownMenuItem>
-                        <DropdownMenuItem class="milestone-status-menu-item" @select="setMilestoneClientStatus('approved')">
-                          <span class="milestone-status-pill milestone-status-pill--approved">Approved</span>
-                        </DropdownMenuItem>
-                        <DropdownMenuItem class="milestone-status-menu-item" @select="setMilestoneClientStatus('rejected')">
-                          <span class="milestone-status-pill milestone-status-pill--rejected">Rejected</span>
+                        <div class="milestone-status-menu-title">Client Status</div>
+                        <DropdownMenuItem
+                          v-for="opt in milestoneClientStatusOptions"
+                          :key="opt.key"
+                          class="milestone-status-menu-item invoice-status-popover-item"
+                          :class="{ 'invoice-status-popover-item--active': milestoneClientStatusSelectedKey === opt.key }"
+                          @select="setMilestoneClientStatus(opt.key)"
+                        >
+                          <span class="invoice-status-popover-left">
+                            <span class="invoice-status-dot" :data-variant="opt.variant" aria-hidden="true" />
+                            <span class="invoice-status-popover-text">{{ opt.label }}</span>
+                          </span>
+                          <span class="invoice-status-popover-radio" :data-on="milestoneClientStatusSelectedKey === opt.key" />
                         </DropdownMenuItem>
                       </DropdownMenuContent>
                     </DropdownMenu>
@@ -6054,6 +6082,15 @@ watch(
 .invoice-status-dot[data-variant="issued"] {
   background: #3b82f6;
 }
+.invoice-status-dot[data-variant="review"] {
+  background: #3b82f6;
+}
+.invoice-status-dot[data-variant="approved"] {
+  background: #16a34a;
+}
+.invoice-status-dot[data-variant="rejected"] {
+  background: #ef4444;
+}
 .invoice-status-dot[data-variant="overdue"] {
   background: #ef4444;
 }
@@ -6719,6 +6756,24 @@ watch(
   margin-top: 0;
   border: none;
   padding: 12px 16px 20px;
+  background: transparent;
+}
+
+/* DropdownMenuContent is rendered in a portal, so keep these styles global. */
+:global(.milestone-status-menu) {
+  background: #ffffff;
+  border: 1px solid #e2e8f0;
+  border-radius: 12px;
+  box-shadow:
+    0 10px 25px rgba(15, 23, 42, 0.12),
+    0 2px 6px rgba(15, 23, 42, 0.08);
+}
+
+:global(.milestone-status-menu-title) {
+  color: #64748b;
+}
+
+:global(.milestone-status-menu-item) {
   background: transparent;
 }
 </style>
