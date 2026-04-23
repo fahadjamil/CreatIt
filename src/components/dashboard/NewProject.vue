@@ -5,6 +5,7 @@ import { Label } from "@/components/ui/label";
 import { Input } from "@/components/ui/input";
 import { DateSelect } from "@/components/ui/date-select";
 import {
+  createClient,
   createProject,
   createProjectMilestone,
   createTag,
@@ -361,6 +362,22 @@ function isPocPhoneFilled(raw: string): boolean {
   return d.length >= 7;
 }
 
+const MAX_E164_DIGITS = 15;
+
+function sanitizePhoneInput(raw: unknown): string {
+  const s = String(raw ?? "");
+  const hasLeadingPlus = s.trim().startsWith("+");
+  const digits = s.replace(/\D/g, "").slice(0, MAX_E164_DIGITS);
+  return (hasLeadingPlus ? "+" : "") + digits;
+}
+
+function onClientMobileInput(e: Event) {
+  const el = e.target as HTMLInputElement | null;
+  const next = sanitizePhoneInput(el?.value);
+  clientMobile.value = next;
+  if (el && el.value !== next) el.value = next;
+}
+
 const clientStep1Complete = computed(() => {
   if (effectiveClientMode.value === "existing") {
     return Boolean(
@@ -398,7 +415,7 @@ function applyApiClientToForm(c: Record<string, unknown>) {
     (c as { pivot?: { role?: string } }).pivot?.role ?? c.role ?? "",
   ).trim();
   clientEmail.value = String(c.poc_email ?? c.email ?? "").trim();
-  clientMobile.value = String(c.poc_phone ?? c.phone ?? c.mobile_number ?? "+92").trim() || "+92";
+  clientMobile.value = sanitizePhoneInput(c.poc_phone ?? c.phone ?? c.mobile_number ?? "+92") || "+92";
 }
 
 function unwrapClientFromResponse(body: unknown): Record<string, unknown> | null {
@@ -587,7 +604,7 @@ const primaryActionDisabled = computed(() => {
   }
   if (
     isAgreementStep.value &&
-    (!agreementTermsAccepted.value || !agreementSendToClient.value)
+    !agreementTermsAccepted.value
   ) {
     return true;
   }
@@ -1627,18 +1644,25 @@ function appendCommonProjectPayloadFields(
   form.append("meta[notes]", scopeDescription.value.trim());
 
   form.append("client[is_primary]", "1");
-  if (createdClientId.value) {
-    form.append("client[id]", createdClientId.value);
-  }
   form.append("client[role]", clientRole.value.trim() || "Contact");
-  form.append("client[type]", clientOrBrand.value === "brand" ? "brand" : "individual");
-  form.append("client[status]", "active");
-  // form.append("client[display_name]", clientContactName.value.trim() || clientName.value.trim());
-  form.append("client[brand_name]", clientName.value.trim());
-  form.append("client[poc_name]", clientContactName.value.trim());
-  form.append("client[poc_email]", clientEmail.value.trim());
-  form.append("client[poc_phone]", clientMobile.value.trim());
-  form.append("client[meta][notes]", "this is a dummy client note");
+  if (createdClientId.value) {
+    /**
+     * When linking an existing client, only send the id (+ pivot fields).
+     * Some backends treat additional nested `client[...]` attributes as "create/update client"
+     * and can ignore `client[id]` during project creation.
+     */
+    form.append("client[id]", createdClientId.value);
+  } else {
+    // Creating a new client inline (legacy fallback).
+    form.append("client[type]", clientOrBrand.value === "brand" ? "brand" : "individual");
+    form.append("client[status]", "active");
+    // form.append("client[display_name]", clientContactName.value.trim() || clientName.value.trim());
+    form.append("client[brand_name]", clientName.value.trim());
+    form.append("client[poc_name]", clientContactName.value.trim());
+    form.append("client[poc_email]", clientEmail.value.trim());
+    form.append("client[poc_phone]", sanitizePhoneInput(clientMobile.value).trim());
+    form.append("client[meta][notes]", "this is a dummy client note");
+  }
 }
 
 function logPayloadPreview(form: FormData, label = "Project Payload") {
@@ -1733,6 +1757,57 @@ async function createMilestonesSequentially(projectId: string) {
   }
 }
 
+function safeClientDisplayNameForApi(): string {
+  const name = clientName.value.trim();
+  const poc = clientContactName.value.trim();
+  if (clientOrBrand.value === "individual") return name || poc || "Client";
+  return poc || name || "Client";
+}
+
+/**
+ * Project creation expects an existing client id.
+ * If user is entering a new client, create it first and store its id.
+ */
+async function ensurePrimaryClientCreated(): Promise<void> {
+  if (String(createdClientId.value ?? "").trim()) return;
+
+  // Existing client mode: treat selected id as the created client id.
+  if (effectiveClientMode.value === "existing") {
+    const selected = String(selectedExistingClientId.value ?? "").trim();
+    if (selected) {
+      createdClientId.value = selected;
+      return;
+    }
+    throw new Error("Missing selected existing client id.");
+  }
+
+  const payload = {
+    type: clientOrBrand.value === "individual" ? "individual" : "brand",
+    status: "active",
+    display_name: safeClientDisplayNameForApi(),
+    brand_name: clientName.value.trim() || safeClientDisplayNameForApi(),
+    poc_name: clientContactName.value.trim() || undefined,
+    poc_email: clientEmail.value.trim() || undefined,
+    poc_phone: sanitizePhoneInput(clientMobile.value).trim() || undefined,
+    // legacy fields (some backends still read these)
+    email: clientEmail.value.trim() || undefined,
+    phone: sanitizePhoneInput(clientMobile.value).trim() || undefined,
+    meta: { notes: "" },
+  };
+
+  const res = await createClient(payload as any, { skipAlert: true });
+  const created = unwrapClientFromResponse(res?.data) ?? {};
+  const id = String((created as any)?.id ?? (created as any)?.uuid ?? "").trim();
+  if (!id) {
+    throw new Error("Create client did not return an id.");
+  }
+
+  createdClientId.value = id;
+  if (created && typeof created === "object") {
+    ensureClientInList(created as Record<string, unknown>);
+  }
+}
+
 async function ensureInitialProjectCreated() {
   if (createdProjectId.value || isSavingInitialProject.value) return;
   if (!validateStep1RequiredFieldsOrAlert()) {
@@ -1742,6 +1817,7 @@ async function ensureInitialProjectCreated() {
   isSavingInitialProject.value = true;
   try {
     await ensureUploadedImageIds();
+    await ensurePrimaryClientCreated();
     const form = new FormData();
 
     // Step 1 create: send safe defaults for payment fields and update them later.
@@ -1765,12 +1841,24 @@ async function ensureInitialProjectCreated() {
     logPayloadPreview(form, "Project Create Payload (Step 1 Draft)");
     const response = await createProject(form);
     const { projectId, clientId } = extractCreatedIds(response?.data);
+    const createdProject = unwrapProjectFromBody(response?.data) ?? {};
+    const createdStatus = normalizeProjectStatus((createdProject as any)?.status);
 
     if (projectId) createdProjectId.value = projectId;
     if (clientId) createdClientId.value = clientId;
 
     if (!createdProjectId.value) {
       throw new Error("Create project did not return a project id.");
+    }
+
+    /**
+     * Some API deployments ignore `status=draft` on initial POST /projects.
+     * Ensure the draft is persisted by patching status after creation.
+     */
+    if (createdStatus !== "draft") {
+      const statusOnly = new FormData();
+      statusOnly.append("status", "draft");
+      await updateProject(createdProjectId.value, statusOnly, { skipAlert: true });
     }
   } finally {
     isSavingInitialProject.value = false;
@@ -1779,6 +1867,7 @@ async function ensureInitialProjectCreated() {
 
 async function submitSingleProject(options?: { statusOverride?: string }) {
   await ensureUploadedImageIds();
+  await ensurePrimaryClientCreated();
   const form = new FormData();
 
   appendCommonProjectPayloadFields(form, {
@@ -1818,6 +1907,7 @@ async function submitSingleProject(options?: { statusOverride?: string }) {
 
 async function submitMilestoneProject(options?: { statusOverride?: string }) {
   await ensureUploadedImageIds();
+  await ensurePrimaryClientCreated();
   const form = new FormData();
 
   appendCommonProjectPayloadFields(form, {
@@ -1939,6 +2029,7 @@ async function refreshRecurringSchedulesFromApi() {
 
 async function submitRecurringProject(options?: { statusOverride?: string }) {
   await ensureUploadedImageIds();
+  await ensurePrimaryClientCreated();
   const form = buildRecurringPatchFormData(options);
 
   logPayloadPreview(
@@ -2463,7 +2554,15 @@ async function handleContinue() {
           </div>
           <div class="new-project-field">
             <Label class="new-project-label">Mobile Number</Label>
-            <Input v-model="clientMobile" placeholder="+92" class="new-project-input" />
+            <Input
+              v-model="clientMobile"
+              placeholder="+92"
+              class="new-project-input"
+              inputmode="tel"
+              autocomplete="tel"
+              :maxlength="MAX_E164_DIGITS + 1"
+              @input="onClientMobileInput"
+            />
           </div>
         </div>
       </section>

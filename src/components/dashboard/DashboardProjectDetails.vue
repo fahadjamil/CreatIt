@@ -2740,16 +2740,61 @@ function onFollowUpPointerUp(e: PointerEvent) {
 
 /** Default copy for the current tone and invoice (used when the customer has not customized the message). */
 const followUpDefaultMessage = computed(() => {
-  const num = selectedInvoice.value?.number ?? "#—";
+  const rawNum = String(selectedInvoice.value?.number ?? "").trim();
+  const num = rawNum ? (rawNum.startsWith("#") ? rawNum : `#${rawNum}`) : "#—";
+  const projectName = String(title.value ?? "").trim() || "your project";
   const grand = invoicePreviewGrandTotal.value;
-  const amt = Number.isFinite(grand) ? previewMoney(grand) : previewMoney(invoicePreviewLineAmount.value);
+  const amountNumber = Number.isFinite(grand) ? grand : invoicePreviewLineAmount.value;
+  const amt = Number.isFinite(amountNumber)
+    ? `${invoiceCurrency.value} ${amountNumber.toLocaleString("en-PK", {
+        minimumFractionDigits: Number.isInteger(amountNumber) ? 0 : 2,
+        maximumFractionDigits: Number.isInteger(amountNumber) ? 0 : 2,
+      })}`
+    : "—";
   const inv = activeInvoice.value;
   const dueRaw = inv?.dueDate ?? projectData.value.end_date ?? projectData.value.due_date ?? projectData.value.dueDate;
-  const due = formatInvoiceDueUs(dueRaw);
-  if (followUpDraft.value.tone === "firm") {
-    return `This is a formal notice that Invoice ${num} for ${amt} was due on ${due}. Please remit payment as soon as possible.`;
+  const due = formatSlashDate(dueRaw);
+
+  const method = followUpDraft.value.method;
+  const tone = followUpDraft.value.tone;
+
+  // Email – Gentle / Firm
+  if (method === "email" && tone === "gentle") {
+    return [
+      "Hi,",
+      "Good day! Just a gentle reminder that invoice " +
+        `${num} for ${projectName}, amounting to ${amt}, was due on ${due}. ` +
+        "I completely understand how busy schedules can get, so I just wanted to give a little nudge to bring this back to the top of your inbox.",
+      "If you have any questions regarding the invoice or need me to resend it, please do let me know, and I’ll be happy to help.",
+      "Best,",
+    ].join("\n\n");
   }
-  return `Hi! Just a friendly reminder that Invoice ${num} for ${amt} was due on ${due}. Let me know if you have any questions! 😊`;
+  if (method === "email" && tone === "firm") {
+    return [
+      "Hi,",
+      "I haven’t heard back from you regarding my last email and wanted to follow up. " +
+        `Invoice ${num} for ${projectName}, amounting to ${amt}, has been overdue since ${due}.`,
+      "Please arrange settlement at the earliest to avoid any service disruption. " +
+        "If there are any issues preventing payment, kindly reach out to me right away so we can resolve them.",
+      "Looking forward to your response.",
+    ].join("\n\n");
+  }
+
+  // WhatsApp – Gentle / Firm
+  if (tone === "firm") {
+    return [
+      "Hi,",
+      `I wanted to follow up regarding invoice ${num} for ${projectName}, amounting to ${amt}, which has been overdue since ${due}.`,
+      "Kindly arrange settlement at the earliest to avoid any disruption in services. " +
+        "If there are any issues holding up the payment, please let me know immediately so we can resolve them.",
+    ].join("\n\n");
+  }
+  return [
+    "Hi,",
+    `Just a quick reminder about invoice ${num} for ${projectName}, amounting to ${amt}, which was due on ${due}. ` +
+      "I totally understand how busy things can get, so I just wanted to bring it to your attention again.",
+    "If you’d like me to resend the invoice or if you have any questions, please let me know.",
+  ].join("\n\n");
 });
 
 const followUpMessagePreview = computed(() => {
