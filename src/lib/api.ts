@@ -657,6 +657,15 @@ export type DashboardPayload = {
   transactions?: unknown[];
 };
 
+export type AccountStatementRow = Record<string, unknown>;
+
+export type AccountStatementPayload = {
+  /** API commonly returns an array; keep flexible. */
+  statement?: AccountStatementRow[];
+  transactions?: AccountStatementRow[];
+  data?: AccountStatementRow[];
+};
+
 /**
  * Dashboard summary: current balance + recent projects/transactions.
  * Backend response shape observed:
@@ -666,6 +675,13 @@ const getDashboard = () =>
   apiClient.get<{ ok?: boolean; data?: DashboardPayload }>("/api/v1/dashboard", {
     skipAlert: true,
   } as any);
+
+/**
+ * Smartlane account statement: full transaction list for Accounts tab.
+ * Expected to return a list (shape may vary), so UI normalizes.
+ */
+const getAccountStatement = () =>
+  apiClient.get("/api/v1/smartlane/account/statement", { skipAlert: true } as any);
 
 /** Weekly/monthly/quarterly runs + amount_per_run for recurring projects (saved project state). */
 const getProjectRecurrenceOptions = (projectId: string | number) =>
@@ -1076,6 +1092,7 @@ export {
   createProject,
   updateProject,
   getDashboard,
+  getAccountStatement,
   getProjects,
   getProjectById,
   getProjectRecurrenceOptions,

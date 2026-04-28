@@ -590,6 +590,11 @@ const getProjectById = (projectId) => apiClient.get(`/api/v1/projects/${projectI
 const getDashboard = () => apiClient.get("/api/v1/dashboard", {
     skipAlert: true,
 });
+/**
+ * Smartlane account statement: full transaction list for Accounts tab.
+ * Expected to return a list (shape may vary), so UI normalizes.
+ */
+const getAccountStatement = () => apiClient.get("/api/v1/smartlane/account/statement", { skipAlert: true });
 /** Weekly/monthly/quarterly runs + amount_per_run for recurring projects (saved project state). */
 const getProjectRecurrenceOptions = (projectId) => apiClient.get(`/api/v1/projects/${projectId}/recurrence-options`, {
     skipAlert: true,
@@ -783,4 +788,4 @@ const getCalendar = (params) => apiClient.get("/api/v1/calendar", {
     params,
     ...{ skipAlert: true },
 });
-export { extractMessage, extractMessageFromAxiosErrorData, extractInvoicePdfUrlFromResponseBody, fetchInvoicePdfBlobFromUrl, interpretInvoicePdfBlob, getInvoicePdfWithRetry, extractUploadedImageIds, API_BASE_URL, apiFetch, buildApiUrl, apiClient, loginUser, getCurrentUser, registerUser, requestPhoneVerificationCode, requestForgotPassword, uploadImages, createProject, updateProject, getDashboard, getProjects, getProjectById, getProjectRecurrenceOptions, createProjectMilestone, sendProjectMilestoneToClient, updateProjectMilestoneStatus, getTags, createTag, getProjectScopes, createClient, getClients, getClientById, updateClient, updateInvoiceFollowUp, updateInvoiceStatus, issueInvoice, getInvoicePdf, getCalendar, getInvoiceTermsTemplates, createInvoiceTermsTemplate, patchInvoice, };
+export { extractMessage, extractMessageFromAxiosErrorData, extractInvoicePdfUrlFromResponseBody, fetchInvoicePdfBlobFromUrl, interpretInvoicePdfBlob, getInvoicePdfWithRetry, extractUploadedImageIds, API_BASE_URL, apiFetch, buildApiUrl, apiClient, loginUser, getCurrentUser, registerUser, requestPhoneVerificationCode, requestForgotPassword, uploadImages, createProject, updateProject, getDashboard, getAccountStatement, getProjects, getProjectById, getProjectRecurrenceOptions, createProjectMilestone, sendProjectMilestoneToClient, updateProjectMilestoneStatus, getTags, createTag, getProjectScopes, createClient, getClients, getClientById, updateClient, updateInvoiceFollowUp, updateInvoiceStatus, issueInvoice, getInvoicePdf, getCalendar, getInvoiceTermsTemplates, createInvoiceTermsTemplate, patchInvoice, };

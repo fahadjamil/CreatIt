@@ -5,6 +5,7 @@ import { Bell, ChevronDown, CirclePlus, FileText, FolderPlus, Link2, TrendingUp 
 import {
   DashboardCalendar,
   DashboardHome,
+  DashboardAccounts,
   DashboardProjectDetails,
   DashboardProjects,
   NewProject,
@@ -23,7 +24,7 @@ import { showColoredToast } from "@/lib/swToast";
 const router = useRouter();
 const { displayLabel, initials, refresh: refreshUserProfile } = useCurrentUser();
 const isSidebarCollapsed = ref(false);
-/** Which main screen: 'home' | 'projects' | 'calendar' | 'clients' */
+/** Which main screen: 'home' | 'projects' | 'calendar' | 'clients' | 'accounts' */
 const currentView = ref("home");
 /** When true, show New Project instead of the projects list screen */
 const showNewProject = ref(false);
@@ -100,6 +101,15 @@ function onProjectsScreenTab(tab) {
 function goToCalendar() {
   showCreateInvoice.value = false;
   currentView.value = "calendar";
+  selectedProjectId.value = null;
+  showNewProject.value = false;
+  editingProjectId.value = null;
+}
+
+function goToAccounts() {
+  showCreateInvoice.value = false;
+  currentView.value = "accounts";
+  projectsInitialTab.value = "projects";
   selectedProjectId.value = null;
   showNewProject.value = false;
   editingProjectId.value = null;
@@ -187,7 +197,12 @@ onMounted(() => {
           <img src="@/assets/icons/Component 7-1.svg" alt="" />
           <span>Projects</span>
         </button>
-        <button class="dashboard-nav-item" type="button">
+        <button
+          class="dashboard-nav-item"
+          :class="{ 'dashboard-nav-item--active': currentView === 'accounts' }"
+          type="button"
+          @click="goToAccounts"
+        >
           <img src="@/assets/icons/Component 7-5.svg" alt="" />
           <span>Accounts</span>
         </button>
@@ -260,7 +275,7 @@ onMounted(() => {
                 <FolderPlus class="size-5 shrink-0 text-[#2563eb]" :stroke-width="2" aria-hidden="true" />
                 <span>Project</span>
               </DropdownMenuItem>
-              <DropdownMenuItem class="dashboard-create-menu-item" @select="goToProjects()">
+              <DropdownMenuItem class="dashboard-create-menu-item" @select="goToAccounts()">
                 <TrendingUp class="size-5 shrink-0 text-[#16a34a]" :stroke-width="2" aria-hidden="true" />
                 <span>Transaction</span>
               </DropdownMenuItem>
@@ -302,8 +317,9 @@ onMounted(() => {
             v-if="currentView === 'home'"
             @view-projects="goToProjects"
             @create-project="openNewProject"
-            @record-transactions="goToProjects"
+            @record-transactions="goToAccounts"
           />
+          <DashboardAccounts v-else-if="currentView === 'accounts'" />
           <DashboardCalendar v-else-if="currentView === 'calendar'" />
           <template v-else>
             <NewProject

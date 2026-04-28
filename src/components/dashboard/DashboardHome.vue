@@ -165,10 +165,14 @@ async function loadProjectsCount() {
     projects.value = list;
     projectsCount.value = list.length;
     setCarouselPage(0);
+
+    const tx = normalizeTransactionsResponse(payload);
+    transactions.value = tx.slice(0, 5);
   } catch (e) {
     projectsCount.value = 0;
     projects.value = [];
     currentBalance.value = null;
+    transactions.value = [];
     setCarouselPage(0);
   } finally {
     isLoading.value = false;
@@ -180,6 +184,8 @@ type TransactionRow = {
   direction: "in" | "out";
   accountName: string;
   projectTitle: string;
+  occurredAt: string;
+  dateLabel: string;
   timeLabel: string;
   amountMasked: string;
 };
@@ -191,17 +197,254 @@ type TransactionGroup = {
 
 const transactions = ref<TransactionRow[]>([]);
 
-const transactionGroups = computed<TransactionGroup[]>(() => {
-  // Empty until transactions API is integrated.
-  // When there are no transactions, the dashboard should show the empty state.
-  if (transactions.value.length === 0) return [];
+function parseDateLoose(raw: string): Date | null {
+  const v = String(raw ?? "").trim();
+  if (!v) return null;
 
-  return [
-    {
-      label: "Transactions",
-      rows: transactions.value,
-    },
+  const native = new Date(v);
+  if (!Number.isNaN(native.getTime())) return native;
+
+  const ymd = /^(\d{4})-(\d{2})-(\d{2})(?:[ T](\d{2}):(\d{2})(?::(\d{2}))?)?/.exec(v);
+  if (ymd) {
+    const y = Number(ymd[1]);
+    const m = Number(ymd[2]) - 1;
+    const d = Number(ymd[3]);
+    const hh = Number(ymd[4] ?? "0");
+    const mm = Number(ymd[5] ?? "0");
+    const ss = Number(ymd[6] ?? "0");
+    const dt = new Date(y, m, d, hh, mm, ss);
+    return Number.isNaN(dt.getTime()) ? null : dt;
+  }
+
+  const dmy = /^(\d{2})[\/-](\d{2})[\/-](\d{4})(?:[ T](\d{2}):(\d{2})(?::(\d{2}))?)?/.exec(v);
+  if (dmy) {
+    const d = Number(dmy[1]);
+    const m = Number(dmy[2]) - 1;
+    const y = Number(dmy[3]);
+    const hh = Number(dmy[4] ?? "0");
+    const mm = Number(dmy[5] ?? "0");
+    const ss = Number(dmy[6] ?? "0");
+    const dt = new Date(y, m, d, hh, mm, ss);
+    return Number.isNaN(dt.getTime()) ? null : dt;
+  }
+
+  const asNum = Number(v);
+  if (Number.isFinite(asNum) && asNum > 0) {
+    const ms = asNum < 1e12 ? asNum * 1000 : asNum;
+    const dt = new Date(ms);
+    return Number.isNaN(dt.getTime()) ? null : dt;
+  }
+
+  return null;
+}
+
+function safePrimitiveText(value: unknown): string {
+  if (value == null) return "";
+  if (typeof value === "string") return value.trim();
+  if (typeof value === "number") return Number.isFinite(value) ? String(value) : "";
+  return "";
+}
+
+function safeObjectLabel(value: unknown): string {
+  if (!value || typeof value !== "object") return "";
+  const o = value as Record<string, unknown>;
+  return (
+    safePrimitiveText(o.name) ||
+    safePrimitiveText(o.title) ||
+    safePrimitiveText(o.display_name) ||
+    safePrimitiveText(o.project_name) ||
+    safePrimitiveText(o.account_name) ||
+    safePrimitiveText(o.account_title) ||
+    ""
+  );
+}
+
+function pickFirstLabel(item: any, candidates: Array<unknown>): string {
+  for (const c of candidates) {
+    const t = safePrimitiveText(c) || safeObjectLabel(c);
+    if (t) return t;
+  }
+  return "";
+}
+
+function extractAccountName(item: any): string {
+  return pickFirstLabel(item, [
+    item?.account_name,
+    item?.accountName,
+    item?.account_title,
+    item?.accountTitle,
+    item?.account,
+    item?.bank_account,
+    item?.bankAccount,
+    item?.sender_name,
+    item?.sender,
+    item?.receiver_name,
+    item?.receiver,
+    item?.from_account,
+    item?.fromAccount,
+    item?.to_account,
+    item?.toAccount,
+    item?.counterparty_name,
+    item?.counterparty,
+    item?.name,
+  ]);
+}
+
+function extractProjectTitle(item: any): string {
+  return pickFirstLabel(item, [
+    item?.project_title,
+    item?.projectTitle,
+    item?.project_name,
+    item?.projectName,
+    item?.project,
+    item?.meta?.project_title,
+    item?.meta?.project_name,
+    item?.reference,
+    item?.description,
+    item?.narration,
+    item?.particular,
+    item?.remarks,
+  ]);
+}
+
+function extractOccurredAt(item: any): string {
+  const candidates: unknown[] = [
+    item?.transaction_date,
+    item?.transactionDate,
+    item?.txn_date,
+    item?.txnDate,
+    item?.value_date,
+    item?.valueDate,
+    item?.posted_at,
+    item?.postedAt,
+    item?.booking_date,
+    item?.bookingDate,
+    item?.created_at,
+    item?.createdAt,
+    item?.date,
+    item?.datetime,
+    item?.time,
+    item?.timestamp,
+    item?.meta?.transaction_date,
+    item?.meta?.value_date,
+    item?.meta?.posted_at,
+    item?.meta?.created_at,
   ];
+
+  for (const c of candidates) {
+    const t = safePrimitiveText(c) || safeObjectLabel(c);
+    if (t) return t;
+  }
+  return "";
+}
+
+function formatTransactionTime(raw: string): string {
+  const d = parseDateLoose(raw);
+  if (!d) return "—";
+  return d.toLocaleTimeString("en-US", { hour: "2-digit", minute: "2-digit" });
+}
+
+function formatTransactionDate(raw: string): string {
+  const d = parseDateLoose(raw);
+  if (!d) return "—";
+  const day = String(d.getDate()).padStart(2, "0");
+  const month = String(d.getMonth() + 1).padStart(2, "0");
+  const yy = String(d.getFullYear()).slice(-2);
+  return `${day}-${month}-${yy}`;
+}
+
+function dayLabel(raw: string): string {
+  if (!raw) return "Transactions";
+  const d = new Date(raw);
+  if (Number.isNaN(d.getTime())) return "Transactions";
+  const now = new Date();
+  const sameDay =
+    d.getFullYear() === now.getFullYear() &&
+    d.getMonth() === now.getMonth() &&
+    d.getDate() === now.getDate();
+  if (sameDay) return "Today";
+  return d.toLocaleDateString("en-US", { weekday: "long", month: "short", day: "numeric" });
+}
+
+function normalizeTransactionsResponse(raw: any): TransactionRow[] {
+  const list =
+    // common: { ok, data: { transactions: [] } }
+    (Array.isArray(raw?.transactions) ? raw.transactions : null) ??
+    (Array.isArray(raw?.data?.transactions) ? raw.data.transactions : null) ??
+    // nested data layers: { data: { transactions: { data: [] } } }
+    (Array.isArray(raw?.transactions?.data) ? raw.transactions.data : null) ??
+    (Array.isArray(raw?.data?.transactions?.data) ? raw.data.transactions.data : null) ??
+    // sometimes: { data: { data: { transactions: [] } } }
+    (Array.isArray(raw?.data?.data?.transactions) ? raw.data.data.transactions : null) ??
+    (Array.isArray(raw?.data?.data?.transactions?.data) ? raw.data.data.transactions.data : null) ??
+    // fallback: if raw itself is a list
+    (Array.isArray(raw?.data) ? raw.data : null) ??
+    (Array.isArray(raw) ? raw : []);
+
+  const rows = list.map((item: any, idx: number): TransactionRow => {
+    const amountRaw =
+      item?.amount ??
+      item?.transaction_amount ??
+      item?.value ??
+      item?.net_amount ??
+      item?.netAmount ??
+      0;
+    const amountNum = Number(amountRaw);
+    const type = String(item?.type ?? item?.direction ?? item?.txn_type ?? "")
+      .trim()
+      .toLowerCase();
+    const direction: "in" | "out" =
+      type === "debit" || type === "out" || type === "withdrawal" || type === "payment"
+        ? "out"
+        : Number.isFinite(amountNum) && amountNum < 0
+          ? "out"
+          : "in";
+
+    const absAmount = Number.isFinite(amountNum) ? Math.abs(amountNum) : 0;
+    const currency = String(item?.currency ?? item?.currency_code ?? "PKR").trim() || "PKR";
+    const formatted = `${currency} ${absAmount.toLocaleString("en-PK", {
+      minimumFractionDigits: 2,
+      maximumFractionDigits: 2,
+    })}`;
+    const createdAt = extractOccurredAt(item);
+
+    const accountName = extractAccountName(item) || "ACCOUNT NAME";
+    const projectTitle = extractProjectTitle(item) || "Project Title";
+
+    return {
+      id: String(item?.id ?? item?.uuid ?? `${createdAt || "tx"}-${idx}`),
+      direction,
+      accountName,
+      projectTitle,
+      occurredAt: createdAt,
+      dateLabel: formatTransactionDate(createdAt),
+      timeLabel: formatTransactionTime(createdAt),
+      amountMasked: direction === "out" ? `- ${formatted}` : formatted,
+    };
+  });
+
+  // Sort newest first when dates exist
+  rows.sort((a: TransactionRow, b: TransactionRow) => {
+    const ad = Date.parse(a.occurredAt);
+    const bd = Date.parse(b.occurredAt);
+    if (Number.isNaN(ad) || Number.isNaN(bd)) return 0;
+    return bd - ad;
+  });
+
+  return rows;
+}
+
+const transactionGroups = computed<TransactionGroup[]>(() => {
+  if (transactions.value.length === 0) return [];
+  const groups = new Map<string, TransactionRow[]>();
+  for (const row of transactions.value) {
+    const label = dayLabel(row.occurredAt);
+    const list = groups.get(label) ?? [];
+    list.push(row);
+    groups.set(label, list);
+  }
+
+  return Array.from(groups.entries()).map(([label, rows]) => ({ label, rows }));
 });
 
 const hasTransactions = computed(() => transactionGroups.value.length > 0);
@@ -387,7 +630,9 @@ onMounted(() => {
                   >
                     {{ row.amountMasked }}
                   </div>
-                  <div class="dashboard-home-transaction-time">{{ row.timeLabel }}</div>
+                  <div class="dashboard-home-transaction-time">
+                    {{ row.dateLabel }} • {{ row.timeLabel }}
+                  </div>
                 </div>
               </div>
             </div>
